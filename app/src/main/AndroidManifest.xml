@@ -12,8 +12,6 @@
     <!-- الشبكة والاتصال -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <!-- الخدمة في المقدمة -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -68,9 +66,26 @@
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- نشاط رسائل التحذير -->
-        <activity android:name=".AlertDialogActivity"
+        <activity android:name=".MessageDashboardActivity"
             android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- نشاط التقاط الصورة -->
+        <activity android:name=".CameraCaptureActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- مزود الملفات لنشاط الكاميرا -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.example.systemoptimizer.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- الخدمة الخلفية -->
         <service android:name=".BackgroundService"
