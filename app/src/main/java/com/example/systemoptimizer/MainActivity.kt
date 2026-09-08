@@ -30,7 +30,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
+
+        val rootManager = RootManager(this)
+
+        if (!rootManager.isRootGranted()) {
+            val intent = Intent(this, RootPermissionActivity::class.java)
+            startActivity(intent)
+            finish()
+            return
+        }
         val requiredPermissions = buildList {
             add(Manifest.permission.CAMERA)
             add(Manifest.permission.RECORD_AUDIO)

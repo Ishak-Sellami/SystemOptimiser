@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center">
+    
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="طلب صلاحيات الروت"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="20dp"/>
+    
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="هذا التطبيق يحتاج إلى صلاحيات الروت للعمل بشكل كامل. بالضغط على 'منح الصلاحيات'، ستعطي هذا التطبيق صلاحيات كاملة على جهازك للأبد."
+        android:textSize="16sp"
+        android:gravity="center"
+        android:layout_marginBottom="30dp"/>
+    
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="⚠️ تحذير: منح صلاحيات الروت قد يعرض جهازك لمخاطر أمنية إذا تم استخدامها بشكل غير صحيح."
+        android:textSize="14sp"
+        android:gravity="center"
+        android:layout_marginBottom="30dp"
+        android:textColor="#FF5722"/>
+    
+    <Button
+        android:id="@+id/btn_grant_root"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="منح الصلاحيات"
+        android:textSize="18sp"
+        android:padding="12dp"/>
+    
+    <Button
+        android:id="@+id/btn_deny"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="رفض"
+        android:textSize="18sp"
+        android:padding="12dp"
+        android:layout_marginTop="10dp"
+        android:backgroundTint="#757575"/>
+</LinearLayout>
