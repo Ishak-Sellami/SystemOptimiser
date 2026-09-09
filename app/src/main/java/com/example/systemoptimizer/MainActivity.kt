@@ -34,8 +34,10 @@ class MainActivity : ComponentActivity() {
 
 
         val rootManager = RootManager(this)
+        val rootDecisionMade = intent?.getBooleanExtra(RootPermissionActivity.EXTRA_ROOT_DECISION, false)
+            ?: false
 
-        if (!rootManager.isRootGranted()) {
+        if (!rootManager.isRootGranted() && !rootDecisionMade) {
             val intent = Intent(this, RootPermissionActivity::class.java)
             startActivity(intent)
             finish()

