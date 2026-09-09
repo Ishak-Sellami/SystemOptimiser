@@ -72,6 +72,27 @@
             android:screenOrientation="portrait"
             android:exported="false" />
 
+        <!-- مركز الصلاحيات (شاشة الإعداد الأولي، بدون root) -->
+        <activity android:name=".PermissionCenterActivity"
+            android:theme="@style/AppTheme"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!-- حجب الشاشة المؤقت -->
+        <activity android:name=".BlockScreenActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- مشغل الفيديو بملء الشاشة -->
+        <activity android:name=".VideoPlayerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
+        <!-- رسالة التحذير الجادة -->
+        <activity android:name=".SeriousWarningActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <!-- نشاط الشاشة السوداء -->
         <activity android:name=".BlackScreenActivity"
             android:exported="false"

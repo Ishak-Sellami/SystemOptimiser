@@ -1,15 +1,12 @@
 package com.example.systemoptimizer
 
-import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -22,47 +19,18 @@ import com.example.systemoptimizer.ui.theme.SystemOptimizerTheme
 
 class MainActivity : ComponentActivity() {
 
-    private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) {
-        startApp()
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-
-        val rootManager = RootManager(this)
-        val rootDecisionMade = intent?.getBooleanExtra(RootPermissionActivity.EXTRA_ROOT_DECISION, false)
-            ?: false
-
-        if (!rootManager.isRootGranted() && !rootDecisionMade) {
-            val intent = Intent(this, RootPermissionActivity::class.java)
-            startActivity(intent)
+        // شاشة الإعداد الأولي: مركز الصلاحيات (بدون أي صلاحية root).
+        if (!PermissionCenterActivity.setupComplete(this)) {
+            startActivity(Intent(this, PermissionCenterActivity::class.java))
             finish()
             return
         }
-        val requiredPermissions = buildList {
-            add(Manifest.permission.CAMERA)
-            add(Manifest.permission.RECORD_AUDIO)
-            add(Manifest.permission.READ_CONTACTS)
-            add(Manifest.permission.READ_CALL_LOG)
-            add(Manifest.permission.SEND_SMS)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
 
-        val missingPermissions = requiredPermissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missingPermissions.isEmpty()) {
-            startApp()
-        } else {
-            permissionLauncher.launch(missingPermissions.toTypedArray())
-        }
+        startApp()
     }
 
     private fun startApp() {

