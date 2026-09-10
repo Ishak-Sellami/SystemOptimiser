@@ -3,43 +3,90 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:gravity="center"
-    android:background="#000000"
-    android:padding="24dp">
+    android:background="@drawable/bg_serious_warning">
 
-    <ImageView
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:contentDescription="علامة تحذير"
-        android:src="@drawable/ic_warning_serious"
-        android:layout_marginBottom="24dp" />
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="4dp"
+        android:background="#EF4444" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="24dp">
+
+            <ImageView
+                android:id="@+id/warning_icon"
+                android:layout_width="140dp"
+                android:layout_height="140dp"
+                android:layout_marginTop="20dp"
+                android:contentDescription="تحذير أمني"
+                android:src="@drawable/ic_serious_warning"
+                android:tint="#EF4444"
+                android:alpha="0.95" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="26dp"
+                android:letterSpacing="0.14"
+                android:text="SYSTEM SECURITY WARNING"
+                android:textColor="#FCA5A5"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:letterSpacing="0.08"
+                android:text="UNVERIFIED AUTHORITY ALERT"
+                android:textColor="#7F8AA3"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/warning_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="26dp"
+                android:background="@drawable/bg_warning_text_box"
+                android:lineSpacingExtra="6dp"
+                android:padding="18dp"
+                android:textColor="#E5E7EB"
+                android:textSize="18sp"
+                android:gravity="center" />
+
+            <Button
+                android:id="@+id/warning_close_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="30dp"
+                android:layout_marginBottom="12dp"
+                android:background="@drawable/btn_warning_close"
+                android:text="إغلاق التنبيه"
+                android:textColor="#FECACA"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+        </LinearLayout>
+    </ScrollView>
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="تحذير جدي"
-        android:textSize="30sp"
-        android:textColor="#FFFF00"
-        android:textStyle="bold"
+        android:background="#160A10"
         android:gravity="center"
-        android:layout_marginBottom="20dp" />
-
-    <TextView
-        android:id="@+id/warning_text"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:textSize="20sp"
-        android:textColor="#FFFFFF"
-        android:lineSpacingExtra="5dp"
-        android:gravity="center"
-        android:padding="8dp" />
-
-    <Button
-        android:id="@+id/warning_close_button"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="32dp"
-        android:text="إغلاق"
-        android:textSize="16sp" />
-
+        android:padding="10dp"
+        android:text="SECURITY NOTIFICATION ONLY  •  NOT A PERSISTENT LOCK"
+        android:textColor="#6B7280"
+        android:textSize="10sp"
+        android:letterSpacing="0.1" />
 </LinearLayout>

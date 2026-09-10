@@ -31,6 +31,11 @@ from controller import (
 ADB = r"C:\Users\lenovo\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 
 
+def _b64(text):
+    import base64
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
 def adb(*args):
     return subprocess.run([ADB, "-s", "emulator-5554", *args],
                           capture_output=True, text=True, timeout=30).stdout.strip()
@@ -43,6 +48,38 @@ def top_resumed():
         if "topResumedActivity" in line:
             return line
     return "(no topResumedActivity line)"
+
+
+def activity_in_dump(cls):
+    """True if the activity class appears in a *live* task record (Hist line)
+    of the activity dump — stays true while the block screen runs, even when
+    the Device-Owner keyguard covers it, and turns false once it finishes."""
+    out = adb("shell", "dumpsys", "activity", "activities")
+    for line in out.splitlines():
+        if "* Hist" in line and cls in line:
+            return True
+    return False
+
+
+def keyguard_showing():
+    """True when the keyguard is up (Device-Owner block screen locks via
+    lockNow). Read from dumpsys window policy KeyguardServiceDelegate."""
+    out = adb("shell", "dumpsys", "window", "policy")
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if "KeyguardServiceDelegate" in line:
+            for probe in lines[i + 1:i + 4]:
+                if "showing=" in probe:
+                    return "showing=true" in probe
+    return False
+
+
+def unlock_screen():
+    """Wake the emulator and dismiss a swipe keyguard."""
+    adb("shell", "input", "keyevent", "224")
+    time.sleep(0.5)
+    adb("shell", "input", "keyevent", "82")
+    time.sleep(0.5)
 
 
 class RuntimeCheckController(PhoneController):
@@ -97,20 +134,30 @@ class RuntimeCheckController(PhoneController):
                 shot = top_resumed()
                 # dumpsys uses "package/.Class" (slash); compare on class name
                 className = activity.split(".")[-1]
-                shown = className in shot
-                print(f"      activity shown -> {shown}  ({shot[:110]})")
-                if status == "OK" and not shown:
+                shown = className in shot or activity_in_dump(className)
+                locked = keyguard_showing()
+                print(f"      activity shown      -> {shown}  ({shot[:110]})")
+                print(f"      keyguard showing    -> {locked}")
+                if status == "OK" and not shown and locked:
+                    # keyguard من lockNow يغطي الشاشة، ويعتبر القفل نفسه دليل ظهور
+                    status = "OK+ACTIVITY_UNDER_KEYGUARD"
+                elif status == "OK" and not shown:
                     status = "ACTIVITY_NOT_SHOWN"
                 elif status == "OK" and shown:
                     status = "OK+ACTIVITY_SHOWN"
                 if activity.endswith("BlockScreenActivity"):
-                    time.sleep(7)
+                    time.sleep(9)
                     after = top_resumed()
-                    expired = className not in after
+                    expired = not activity_in_dump(className)
                     print(f"      after auto-expire (5s) -> {after[:110]}")
-                    print(f"      auto-expired            -> {expired}")
+                    print(f"      live task gone          -> {expired}")
                     if status == "OK+ACTIVITY_SHOWN" and not expired:
                         status = "OK+SHOWN+NO_AUTO_EXPIRE"
+                    elif expired:
+                        status = status.replace("OK+ACTIVITY_SHOWN", "OK+SHOWN+AUTO_EXPIRED")\
+                                       .replace("OK+ACTIVITY_UNDER_KEYGUARD",
+                                                "OK+KEYGUARD+AUTO_EXPIRED")
+                unlock_screen()
             self.results.append((name, status))
 
         try:
@@ -148,10 +195,31 @@ def main():
     time.sleep(1)
     ctrl.add("serious warning empty rejected",
              "show_serious_warning:", ok_fragments=["نص التحذير فارغ"])
-    ctrl.add("play_video missing resource (empty library)",
-             "play_video:1", ok_fragments=["غير موجود في المكتبة"])
+    ctrl.add("play_video:2 -> fullscreen asset player",
+             "play_video:2",
+             ok_fragments=["تم تشغيل الفيديو بملء الشاشة"],
+             check_activity="com.example.systemoptimizer.VideoPlayerActivity",
+             wait_activity=1)
+    adb("shell", "input", "keyevent", "4")
+    time.sleep(1)
+    ctrl.add("play_video missing file -> not in library",
+             "play_video:99", ok_fragments=["غير موجود في المكتبة"])
     ctrl.add("play_video invalid id rejected",
              "play_video:abc", ok_fragments=["رقم الفيديو غير صالح"])
+    ctrl.add("block_app display name -> INVALID PACKAGE NAME",
+             "block_app:YouTube", ok_fragments=["INVALID PACKAGE NAME"])
+    ctrl.add("capture_camera -> PHOTO_OK or honest reason",
+             "capture_camera",
+             ok_fragments=["PHOTO_OK", "لا توجد كاميرا", "فشل", "مهلة", "صلاحية"])
+    ctrl.add("shell_start -> session opened",
+             "shell_start", ok_fragments=["SHELL_SESSION_STARTED"])
+    ctrl.add("shell_cmd id -> identity shown",
+             "shell_cmd:" + _b64("id"), ok_fragments=["uid="])
+    ctrl.add("shell_cmd getprop -> device model",
+             "shell_cmd:" + _b64("getprop ro.product.model"),
+             ok_fragments=["sdk_gphone", "goldfish", "ranchu"])
+    ctrl.add("shell_exit -> session closed",
+             "shell_exit", ok_fragments=["SHELL_SESSION_CLOSED"])
     ctrl.add("remove_freefire honest outcome",
              "remove_freefire",
              ok_fragments=["SUCCESS", "NOT PERMITTED", "PACKAGE NOT FOUND", "COMMAND FAILED"])
@@ -161,7 +229,8 @@ def main():
     ctrl.add("network_deg preserved (5-field parse)",
              "network_deg:100:0:0:30",
              ok_fragments=["تم تطبيق خفض الشبكة", "لا يمكن تطبيق خفض الشبكة",
-                           "تطبيق خفض الشبكة", "واجهة الشبكة"])
+                           "interface not found", "tc unavailable",
+                           "واجهة الشبكة"])
     ctrl.add("black_screen_on_boot preserved",
              "black_screen_on_boot",
              ok_fragments=["الشاشة السوداء"])

@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">SystemOptimizer</string>
+    <string name="device_admin_label">SystemOptimizer Admin</string>
+    <string name="device_admin_description">يسمح لـ SystemOptimizer بفرض قفل مؤقت للشاشة أثناء مهمة الحجب فقط، في بيئات المختبر المعزولة عند ترقيته إلى Device Owner عبر adb.</string>
 </resources>
