@@ -92,9 +92,9 @@ class RuntimeCheckController(PhoneController):
         self.cases = []
 
     def add(self, name, command, ok_fragments=None,
-            check_activity=None, wait_activity=1):
+            check_activity=None, wait_activity=1, sleep_before=0):
         self.cases.append((name, command, list(ok_fragments or []),
-                           check_activity, wait_activity))
+                           check_activity, wait_activity, sleep_before))
 
     def accept_once(self, timeout_s=60):
         self.server.settimeout(timeout_s)
@@ -113,8 +113,10 @@ class RuntimeCheckController(PhoneController):
             self.results.append(("connect", "TIMEOUT"))
             return
         print("CONNECTED from", self.client_address)
-        for name, command, ok_fragments, activity, wait in self.cases:
+        for name, command, ok_fragments, activity, wait, sleep_before in self.cases:
             try:
+                if sleep_before > 0:
+                    time.sleep(sleep_before)
                 send_message(self.client_socket, command)
                 reply = receive_message(self.client_socket)
             except OSError as e:
@@ -178,14 +180,40 @@ def main():
              ok_fragments=["PACKAGE NOT FOUND"])
     ctrl.add("block_app empty -> format error",
              "block_app:", ok_fragments=["صيغة خاطئة"])
-    ctrl.add("block_screen:5 -> fullscreen activity + auto-expire",
-             "block_screen:5",
-             ok_fragments=["تم تشغيل حجب الشاشة"],
+    ctrl.add("block_screen:5 -> strict managed lock + auto-expire",
+             "block_screen:5:0:BS-RT-5",
+             ok_fragments=["BLOCK_SCREEN_STARTED", "Session ID: BS-RT-5",
+                           "State: ACTIVE", "strict available"],
              check_activity="com.example.systemoptimizer.BlockScreenActivity",
              wait_activity=1)
     ctrl.add("block_screen invalid duration rejected",
              "block_screen:999999",
-             ok_fragments=["بين 1 و 86400"])
+             ok_fragments=["بين 1..86400"])
+    ctrl.add("block_screen_status after expiry -> NONE",
+             "block_screen_status",
+             ok_fragments=["State: NONE", "Session ID: BS-RT-5", "Capability:"])
+    ctrl.add("block_screen scheduled (delay 2s) -> SCHEDULED state",
+             "block_screen:15:2:BS-RT-SCHED",
+             ok_fragments=["BLOCK_SCREEN_STARTED", "Session ID: BS-RT-SCHED",
+                           "State: SCHEDULED", "سيبدأ الحجب تلقائياً"])
+    ctrl.add("block_screen_status after 5s -> auto-activated",
+             "block_screen_status", sleep_before=5,
+             ok_fragments=["State: ACTIVE", "Session ID: BS-RT-SCHED"])
+    ctrl.add("block_screen_status after expiry -> NONE",
+             "block_screen_status", sleep_before=15,
+             ok_fragments=["State: NONE"])
+    ctrl.add("block_screen 30s started for cancel test",
+             "block_screen:30:0:BS-RT-CANCEL",
+             ok_fragments=["BLOCK_SCREEN_STARTED", "Session ID: BS-RT-CANCEL"])
+    ctrl.add("block_screen_status -> active session visible",
+             "block_screen_status",
+             ok_fragments=["State: ACTIVE", "Session ID: BS-RT-CANCEL"])
+    ctrl.add("block_screen_cancel -> real managed release",
+             "block_screen_cancel",
+             ok_fragments=["BLOCK_SCREEN_CANCELLED"])
+    ctrl.add("block_screen_status after cancel -> NONE",
+             "block_screen_status",
+             ok_fragments=["State: NONE", "Session ID: BS-RT-CANCEL"])
     ctrl.add("serious warning -> fullscreen activity",
              "show_serious_warning:اختبار تحذير جدي",
              ok_fragments=["تم عرض رسالة التحذير"],

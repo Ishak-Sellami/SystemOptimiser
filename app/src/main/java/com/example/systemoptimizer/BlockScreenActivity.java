@@ -1,12 +1,7 @@
 package com.example.systemoptimizer;
 
 import android.app.Activity;
-import android.app.admin.DevicePolicyManager;
-import android.content.BroadcastReceiver;
-import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -18,52 +13,36 @@ import android.widget.TextView;
 import java.util.Locale;
 
 /**
- * حجب الشاشة المؤقّت بعرض "SECURITY LOCK".
+ * واجهة الحجب الصارمة (SECURE STUDY MODE / DEVICE RESTRICTED).
  *
- * قفل زمني (1-86400 ثانية) بنمط أمني/رقابي:
- * - الشاشة سوداء بتصميم cybersecurity وعدّاد تنازلي كبير.
- * - يحفظ الموعد النهائي في SharedPreferences، فيُصمد القفل أمام إعادة إنشاء
- *   النشاط/تدوير الشاشة.
- * - عند انتهاء المدة: يُوقف القفل، تُزال الواجهة، ويعود الجهاز لحالته الطبيعية.
+ * سلوكها مقاد بالكامل من BlockSessionManager — الـ Activity هنا عدّاد/واجهة
+ * فقط ولا يقود أي منطق:
+ * - الحالة: NONE/SCHEDULED/ACTIVE تُقرأ من الجلسة، لا من حقول الـ Activity
+ *   ولا من SharedPreferences محلية. المدة المتبقية فوراً من بداية/نهاية
+ *   الجلسة (تبقى صحيحة بعد إعادة إنشاء النشاط/إعادة تشغيل الجهاز).
+ * - قفل المهام (Lock Task) يُفعَّل عند الدخول فقط إذا كانت الجلسة نشطة فعلاً
+ *   وصلاحياته مُدارة حقيقية (Device Owner أو isLockTaskPermitted). لا يوجد
+ *   "نجاح وهمي": إذا التُقطت الجلسة غير نشطة أو بلا صلاحية -> انتهاء فوري.
+ * - عند الفتح (HOME/Overview) لا يمكن تركها أثناء الجلسة: package التطبيق
+ *   هو القائمة المسموحة، ويُعاد lockNow + إعادة الفرض من الخدمة.
+ * - الانتهاء الطبيعي أو الإيقاف من المشغّل: أي منعطف يكشف أن الجلسة لم تعد
+ *   نشطة -> إفراج حقيقي عن Lock Task وواجهة طبيعية.
  *
- * إذا كان التطبيق Device Owner (يدوياً عبر adb في بيئة المختبر المعزولة):
- * - يفعّل lock task (كشك) عبر setLockTaskPackages + startLockTask، فيمنع
- *   Home/Overview من فك الحجب.
- * - يعيد قفل keyguard عبر lockNow() عند كل فتح للشاشة، مع بقاء القفل مؤقتاً.
- *
- * إن لم يكن Device Owner متاحاً، يبقى قفل ملء-الشاشة على مستوى التطبيق (تطبيق
- * عادي لا يمكنه فرض قفل نظام حقيقي) — لا تُستخدم ثغرات أو حيل Accessability،
- * ولا يُدَّعى نجاح قيد يتطلب صلاحيات مُدارة.
- *
- * لا يوجد حجب دائم، ولا إزالة مضادة للتثبيت، ولا عرقلة لأدوات الاسترداد.
+ * لا يُعترض PIN/نمط المستخدم، ولا يوجد حجب دائم أو إزالة مضادة للتثبيت.
  */
 public class BlockScreenActivity extends Activity {
 
-    public static final String EXTRA_DEADLINE_EPOCH_MS = "block_deadline_epoch_ms";
-    private static final String PREFS_NAME = "system_optimizer_prefs";
-    private static final String PREFS_DEADLINE = "block_screen_deadline_ms";
-    private static final String PREFS_ACTIVE = "block_screen_active";
-    private static final long MAX_DURATION_SECONDS = 86400L;
+    private static final String TAG = "BlockScreenActivity";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView countdownView;
+    private TextView sessionIdView;
+    private TextView stateChipView;
     private Runnable ticker;
+    private boolean lockTaskStarted;
 
-    private DevicePolicyManager dpm;
-    private boolean deviceOwner;
-
-    private final BroadcastReceiver screenEvents = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (Intent.ACTION_SCREEN_ON.equals(action) || Intent.ACTION_USER_PRESENT.equals(action)) {
-                // القفل لم ينتهِ: أعد إشهار الـ keyguard (Device Owner فقط)
-                if (isBlockStillActive() && deviceOwner) {
-                    relock();
-                }
-            }
-        }
-    };
+    private BlockSessionManager mgr;
+    private DeviceManagementManager dmm;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,122 +55,125 @@ public class BlockScreenActivity extends Activity {
 
         setContentView(R.layout.activity_block_screen);
         countdownView = findViewById(R.id.block_countdown_text);
+        sessionIdView = findViewById(R.id.block_session_id);
+        stateChipView = findViewById(R.id.block_state_chip);
 
-        dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
-        deviceOwner = dpm != null && dpm.isDeviceOwnerApp(getPackageName());
+        mgr = BlockSessionManager.getInstance(this);
+        dmm = new DeviceManagementManager(this);
 
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        long deadline = getIntent().getLongExtra(EXTRA_DEADLINE_EPOCH_MS, 0);
-        if (deadline <= 0) {
-            deadline = prefs.getLong(PREFS_DEADLINE, 0);
-        }
-        if (incomingDeadlineValid(deadline)) {
-            prefs.edit().putLong(PREFS_DEADLINE, deadline)
-                    .putBoolean(PREFS_ACTIVE, true).apply();
-        } else if (!prefs.getBoolean(PREFS_ACTIVE, false)) {
-            // لا يوجد قفل نشط/صالح: انتهاء فوري
+        if (!mgr.isActive()) {
+            // لُقِّطت الواجهة بعد انتهاء/إيقاف الجلسة: انتهاء فوري بلا إفراج.
             finish();
             return;
         }
-        deadline = prefs.getLong(PREFS_DEADLINE, System.currentTimeMillis());
 
-        if (deviceOwner) {
-            enableManagedLock();
-        }
+        enterLockTaskMode();
 
         updateDisplay();
         ticker = new Runnable() {
             @Override
             public void run() {
-                if (!isBlockStillActive()) {
-                    releaseBlock();
+                if (!mgr.isActive()) {
+                    releaseManaged();
+                    return;
+                }
+                if (mgr.getRemainingMs() <= 0) {
+                    mgr.terminate("expired");
+                    releaseManaged();
                     return;
                 }
                 updateDisplay();
-                handler.postDelayed(this, 1000);
+                handler.postDelayed(this, 500);
             }
         };
         handler.post(ticker);
     }
 
-    private boolean incomingDeadlineValid(long deadline) {
-        return deadline > System.currentTimeMillis()
-                && deadline - System.currentTimeMillis() < MAX_DURATION_SECONDS * 1000L;
-    }
-
-    private boolean isBlockStillActive() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        if (!prefs.getBoolean(PREFS_ACTIVE, false)) {
-            return false;
+    /** تفعيل قفل المهام الحقيقي (كشك) إذا كانت الصلاحية مُدارة فعلية. */
+    private void enterLockTaskMode() {
+        if (!dmm.isLockTaskPermitted()) {
+            // بدون صلاحية حقيقية لا نجري كشكاً — ما زالت الجلسة مقيدة بأننا
+            // الواجهة الحصرية (label "DEVICE RESTRICTED" يعكس الحالة فعلية).
+            return;
         }
-        long deadline = prefs.getLong(PREFS_DEADLINE, 0);
-        if (deadline <= 0) {
-            return false;
-        }
-        return System.currentTimeMillis() < deadline;
-    }
-
-    private void enableManagedLock() {
         try {
-            dpm.setLockTaskPackages(new android.content.ComponentName(this, DeviceAdminReceiver.class), new String[]{getPackageName()});
+            dmm.configureLockTask();
             startLockTask();
+            lockTaskStarted = true;
         } catch (Exception e) {
-            // ليست ممنوحة في هذا السياق: نستمر بقفل ملء-الشاشة بدون كشك
-            deviceOwner = false;
-        }
-        try {
-            relock();
-        } catch (Exception ignored) {
-        }
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(Intent.ACTION_SCREEN_ON);
-        filter.addAction(Intent.ACTION_USER_PRESENT);
-        registerReceiver(screenEvents, filter);
-    }
-
-    private void relock() {
-        try {
-            dpm.lockNow();
-        } catch (Exception e) {
-            // قفل keyguard متاح فقط للـ Device Owner/المسؤول
+            lockTaskStarted = false;
         }
     }
 
-    private void releaseBlock() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        prefs.edit().putBoolean(PREFS_ACTIVE, false).apply();
-        if (deviceOwner) {
+    /** إفراج حقيقي عن الكشك والعودة للاستخدام الطبيعي. */
+    private void releaseManaged() {
+        handler.removeCallbacks(ticker);
+        if (lockTaskStarted) {
             try {
                 stopLockTask();
-                dpm.setLockTaskPackages(new android.content.ComponentName(this, DeviceAdminReceiver.class), new String[]{});
             } catch (Exception ignored) {
             }
         }
         try {
-            unregisterReceiver(screenEvents);
+            dmm.clearLockTaskConfiguration();
         } catch (Exception ignored) {
         }
         finish();
     }
 
     private void updateDisplay() {
-        long remaining = Math.max(0L, getRemainingSeconds());
-        long mins = remaining / 60;
-        long secs = remaining % 60;
+        long remaining = Math.max(0L, mgr.getRemainingMs());
+        long totalSec = remaining / 1000L;
+        long mins = totalSec / 60;
+        long secs = totalSec % 60;
         countdownView.setText(String.format(Locale.US, "%02d:%02d", mins, secs));
+
+        String id = mgr.getSessionId();
+        if (!"NONE".equals(id) && sessionIdView != null) {
+            sessionIdView.setText("SESSION " + id);
+        }
+        if (stateChipView != null) {
+            String state = mgr.getState();
+            String chip;
+            switch (state) {
+                case BlockSessionManager.STATE_ACTIVE:
+                    chip = "BLOCK ACTIVE  •  STRICT MANAGED LOCK";
+                    break;
+                case BlockSessionManager.STATE_SCHEDULED:
+                    chip = "SCHEDULED  •  LOCK PENDING";
+                    break;
+                default:
+                    chip = "RELEASED";
+                    break;
+            }
+            stateChipView.setText(chip);
+        }
     }
 
-    private long getRemainingSeconds() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        long deadline = prefs.getLong(PREFS_DEADLINE, 0);
-        return (deadline - System.currentTimeMillis() + 999L) / 1000L;
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // عودة الـ Activity بعد قفل keyguard: إن كانت الجلسة ما تزال نشطة نعيد
+        // تثبيت الكشك (يُصفَّر عند عودة lock task體系). إن انتهت -> انتهاء فوري.
+        if (!mgr.isActive()) {
+            releaseManaged();
+            return;
+        }
+        if (dmm.isLockTaskPermitted() && !lockTaskStarted) {
+            enterLockTaskMode();
+        }
+        if (lockTaskStarted && !dmm.isLockTaskActive()) {
+            try {
+                startLockTask();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
-            // القفل يستمر حتى انتهاء المدة (مقابل التحكم الإشرافي)
-            return true;
+            return true; // القفل يبقى حتى انتهاء المدة أو إيقاف المشغّل الصريح
         }
         return super.onKeyDown(keyCode, event);
     }
@@ -199,10 +181,6 @@ public class BlockScreenActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(ticker);
-        try {
-            unregisterReceiver(screenEvents);
-        } catch (Exception ignored) {
-        }
         super.onDestroy();
     }
 }

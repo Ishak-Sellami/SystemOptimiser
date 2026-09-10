@@ -65,6 +65,15 @@
             android:layout_marginTop="10dp" />
 
         <Button
+            android:id="@+id/pc_btn_diagnostics"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="حالة إدارة الجهاز والجلسة (تشخيص)"
+            android:textSize="16sp"
+            android:padding="12dp"
+            android:layout_marginTop="10dp" />
+
+        <Button
             android:id="@+id/pc_btn_start"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

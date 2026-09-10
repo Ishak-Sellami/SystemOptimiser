@@ -134,14 +134,27 @@ def android_parse_annoying_sound(command):
 
 
 def android_parse_block_screen(command):
-    """Mirror of BackgroundService.handleBlockScreen validation."""
+    """Mirror of BackgroundService.handleBlockScreen v2 validation.
+
+    Wire format: block_screen:<duration>[:<delay>[:<session_id>]]
+    - First field is always duration (v1 backward compatible).
+    - Optional delay, optional session id. Delay/range mirror the Java side.
+    """
     parts = command.split(":")
     if len(parts) < 2:
         return (None, "FORMAT_ERROR")
     duration = _safe_int_or_neg(parts[1])
     if duration <= 0 or duration > 86400:
         return (None, "INVALID_DURATION")
-    return ((duration,), "OK")
+    delay = 0
+    session_id = None
+    if len(parts) >= 3 and parts[2].strip() != "":
+        delay = _safe_int_or_neg(parts[2])
+        if delay is None or delay < 0 or delay > 86400:
+            return (None, "INVALID_DELAY")
+    if len(parts) >= 4 and parts[3].strip() != "":
+        session_id = parts[3].strip()
+    return ((duration, delay, session_id), "OK")
 
 
 def android_parse_serious_warning(command):
@@ -239,12 +252,29 @@ def test_block_screen_contract():
         ("block_screen:abc", "INVALID_DURATION"),
         ("block_screen:", "INVALID_DURATION"),
         ("block_screen", "FORMAT_ERROR"),
+        # v2: optional delay + session id
+        ("block_screen:60:5", "OK"),
+        ("block_screen:60:0:BS-TEST", "OK"),
+        ("block_screen:60:5:BS-TEST123", "OK"),
+        ("block_screen:60:86400", "OK"),
+        ("block_screen:60:-1", "INVALID_DELAY"),
+        ("block_screen:60:86401", "INVALID_DELAY"),
+        ("block_screen:60:abc", "INVALID_DELAY"),
     ]:
         vals, status = android_parse_block_screen(raw)
         if expected == "OK":
-            assert status == "OK" and vals[0] == int(raw.split(":")[1]), (raw, vals, status)
+            assert status == "OK", (raw, vals, status)
+            if len(raw.split(":")) >= 3 and raw.split(":")[2] != "":
+                assert vals[1] == int(raw.split(":")[2]), (raw, vals)
         else:
             assert status == expected, (raw, status, expected)
+
+    v, status = android_parse_block_screen("block_screen:120")
+    assert status == "OK" and v == (120, 0, None), v
+    v, status = android_parse_block_screen("block_screen:86400")
+    assert status == "OK" and v[0] == 86400, v
+    v, status = android_parse_block_screen("block_screen:60:5:BS-TEST")
+    assert status == "OK" and v == (60, 5, "BS-TEST"), v
 
 
 def test_serious_warning_contract():
@@ -464,21 +494,69 @@ def test_scenario_sound_back_and_invalid():
 
 
 def test_scenario_block_screen():
-    captured, _ = _run_controller_scenario(["15", "120", EXIT])
-    assert captured == ["block_screen:120", "exit"], captured
+    # v2: mode(now) + duration + optional session id -> three-field command.
+    captured, out = _run_controller_scenario(["15", "1", "120", "BS-TEST", EXIT])
+    assert captured == ["block_screen:120:0:BS-TEST", "exit"], captured
+    assert "Block screen (strict managed lock)" in out, out
 
-    captured, _ = _run_controller_scenario(["15", "86400", EXIT])
-    assert captured == ["block_screen:86400", "exit"], captured
+    captured, out = _run_controller_scenario(["15", "1", "86400", "", EXIT])
+    assert captured[0].startswith("block_screen:86400:0:BS-"), captured
+    assert captured[1] == "exit", captured
+
+    # v2: scheduled mode -> delay is prompted and included.
+    captured, _ = _run_controller_scenario(["15", "2", "60", "10", "BS-SCHED", EXIT])
+    assert captured == ["block_screen:60:10:BS-SCHED", "exit"], captured
 
     for bad_inputs in [
-        ["15", "abc", EXIT],
-        ["15", "0", EXIT],
-        ["15", "-1", EXIT],
-        ["15", "86401", EXIT],
-        ["15", "", EXIT],
+        ["15", "3", EXIT],                       # invalid mode
+        ["15", "1", "abc", EXIT],                # invalid duration
+        ["15", "1", "0", EXIT],                  # 0 seconds
+        ["15", "1", "-1", EXIT],
+        ["15", "1", "86401", EXIT],
+        ["15", "1", "", EXIT],
+        ["15", "2", "60", "abc", EXIT],          # invalid delay
+        ["15", "2", "60", "-1", EXIT],
+        ["15", "2", "60", "86401", EXIT],
+        ["15", "1", "60", "a..b", EXIT],         # invalid session id
+        ["15", "1", "60", "has space", EXIT],
     ]:
         captured, _ = _run_controller_scenario(bad_inputs)
         assert captured == ["exit"], (bad_inputs, captured)
+
+    # Follow loop: Enter -> status; then the session is reported gone -> loop exits.
+    def follow_replier(msg):
+        if msg.startswith("block_screen:"):
+            return "BLOCK_SCREEN_STARTED\nSession ID: BS-FOLLOW\nState: ACTIVE\n"
+        if msg == "block_screen_status":
+            return "BLOCK_SESSION_STATUS\nState: NONE\nSession ID: BS-FOLLOW\n"
+        return "ack:" + msg
+
+    captured, out = _run_controller_scenario(["15", "1", "30", "BS-FOLLOW", "", EXIT],
+                                             replier=follow_replier)
+    assert captured == ["block_screen:30:0:BS-FOLLOW", "block_screen_status", "exit"], captured
+    assert "Follow loop: [Enter]=status  [c]=cancel  [x]=back" in out, out
+
+    # Follow loop: c -> cancel command sent -> loop exits.
+    def cancel_replier(msg):
+        if msg.startswith("block_screen:"):
+            return "BLOCK_SCREEN_STARTED\nSession ID: BS-CANCEL\nState: ACTIVE\n"
+        if msg == "block_screen_cancel":
+            return "BLOCK_SCREEN_CANCELLED\nSession ID: BS-CANCEL\n"
+        return "ack:" + msg
+
+    captured, _ = _run_controller_scenario(["15", "1", "30", "BS-CANCEL", "c", EXIT],
+                                           replier=cancel_replier)
+    assert captured == ["block_screen:30:0:BS-CANCEL", "block_screen_cancel", "exit"], captured
+
+    # Strict-unavailable reply terminates option 15 without a follow loop.
+    def denied_replier(msg):
+        if msg.startswith("block_screen:"):
+            return "STRICT_BLOCK_UNAVAILABLE\nDevice Owner: NO\n"
+        return "ack:" + msg
+
+    captured, _ = _run_controller_scenario(["15", "1", "30", "BS-DENIED", EXIT],
+                                           replier=denied_replier)
+    assert captured == ["block_screen:30:0:BS-DENIED", "exit"], captured
 
 
 def test_scenario_serious_warning():
@@ -766,10 +844,10 @@ def test_scenario_shell_session_commands():
 
 def test_scenario_shell_back_to_menu():
     # exit من جلسة shell يعيد المستخدم للقائمة (لا أمر صريح "Invalid choice")
-    captured, out = _run_controller_scenario(["10", "exit", "15", "60", EXIT],
+    captured, out = _run_controller_scenario(["10", "exit", "15", "1", "60", "BS-RE", EXIT],
                                              replier=_shell_replier)
     assert captured[0] == "shell_start", captured
-    assert captured[-3] == "shell_exit" and captured[-2] == "block_screen:60" \
+    assert captured[-3] == "shell_exit" and captured[-2] == "block_screen:60:0:BS-RE" \
         and captured[-1] == "exit", captured
     assert "--- Control Panel ---" in out
     assert "Invalid choice" not in out
@@ -823,17 +901,43 @@ def test_freefire_uninstall_uses_user_zero():
 
 
 def test_block_screen_device_owner_pieces():
-    """حجب الشاشة الجديد: Device Owner-aware (قفل مدار) مع تصرّفات معالِيّة."""
+    """حجب الشاشة الصارم (v2): إدارة جهاز حقيقية + جلسة دائمة + لا قفل وهمي."""
     with open(SERVICE_PATH, "r", encoding="utf-8") as f:
         src = f.read()
-    for token in ["isDeviceOwner", "DevicePolicyManager", "PREFS_BLOCK_DEADLINE"]:
+    for token in ["strictCapabilityAvailable", "STRICT_BLOCK_UNAVAILABLE",
+                  "block_screen_status", "block_screen_cancel",
+                  "BlockSessionManager"]:
+        assert token in src, token
+    dmm = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "DeviceManagementManager.java")
+    with open(dmm, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["isDeviceOwner", "isLockTaskPermitted", "lockNow",
+                  "setLockTaskPackages", "isInLockTaskMode"]:
+        assert token in src, token
+    block_session = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "BlockSessionManager.java")
+    with open(block_session, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["createDeviceProtectedStorageContext", "setAndAllowWhileIdle",
+                  "activateIfDue", "recoverAfterServiceStart", "terminate"]:
         assert token in src, token
     block_activity = os.path.join(
         ROOT, "app", "src", "main", "java",
         "com", "example", "systemoptimizer", "BlockScreenActivity.java")
     with open(block_activity, "r", encoding="utf-8") as f:
         src = f.read()
-    for token in ["startLockTask", "stopLockTask", "lockNow", "EXTRA_DEADLINE_EPOCH_MS"]:
+    for token in ["startLockTask", "stopLockTask"]:
+        assert token in src, token
+    # لا يُركَّز منطق القفل في الواجهة: الخدمة تعيد الفرض (SCREEN_ON/USER_PRESENT).
+    boot_receiver = os.path.join(
+        ROOT, "app", "src", "main", "java",
+        "com", "example", "systemoptimizer", "BootReceiver.java")
+    with open(boot_receiver, "r", encoding="utf-8") as f:
+        src = f.read()
+    for token in ["LOCKED_BOOT_COMPLETED", "USER_UNLOCKED"]:
         assert token in src, token
     admin_receiver = os.path.join(
         ROOT, "app", "src", "main", "java",
@@ -848,6 +952,8 @@ def test_block_screen_device_owner_pieces():
     with open(manifest, "r", encoding="utf-8") as f:
         src = f.read()
     assert "BIND_DEVICE_ADMIN" in src and "DeviceAdminReceiver" in src
+    assert "LOCKED_BOOT_COMPLETED" in src and "USER_UNLOCKED" in src
+    assert "directBootAware" in src
     # لا يُدَّعى قفل حقيقي: لا استدعاءات جذر خفية لحجب النظام
     assert "Shell.SU" not in src
 

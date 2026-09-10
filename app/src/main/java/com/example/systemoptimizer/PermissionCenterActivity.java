@@ -63,6 +63,7 @@ public class PermissionCenterActivity extends ComponentActivity {
         runtimeButton = findViewById(R.id.pc_btn_runtime);
         Button overlayButton = findViewById(R.id.pc_btn_overlay);
         Button writeSettingsButton = findViewById(R.id.pc_btn_write_settings);
+        Button diagnosticsButton = findViewById(R.id.pc_btn_diagnostics);
         startButton = findViewById(R.id.pc_btn_start);
 
         runtimeButton.setOnClickListener(new View.OnClickListener() {
@@ -92,6 +93,14 @@ public class PermissionCenterActivity extends ComponentActivity {
                 Intent intent = new Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS,
                         Uri.parse("package:" + getPackageName()));
                 startActivity(intent);
+            }
+        });
+
+        diagnosticsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(PermissionCenterActivity.this,
+                        ManagementDiagnosticsActivity.class));
             }
         });
 

@@ -109,6 +109,12 @@
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
+        <!-- تشخيصات إدارة الجهاز وحالة جلسة الحجب الصارمة -->
+        <activity android:name=".ManagementDiagnosticsActivity"
+            android:exported="false"
+            android:theme="@style/AppTheme"
+            android:screenOrientation="portrait" />
+
         <!-- مستقبل إدارة الأجهزة (Device Owner) لحجب الشاشة -->
         <receiver android:name=".DeviceAdminReceiver"
             android:description="@string/device_admin_description"
@@ -140,14 +146,22 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- مستقبل بدء التشغيل -->
+        <!-- مستقبل بدء التشغيل/الإقلاع وإعادة استعادة جلسة الحجب بعد الإقلاع -->
         <receiver android:name=".BootReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
             </intent-filter>
         </receiver>
+
+        <!-- مستقبل مؤشرات جلسة الحجب (تشغيل مجدول / انتهاء) -->
+        <receiver android:name=".BlockSessionAlarmReceiver"
+            android:enabled="true"
+            android:exported="false" />
 
         <!-- مستقبل الشاشة السوداء عند بدء التشغيل -->
         <receiver android:name=".BlackScreenBootReceiver"

