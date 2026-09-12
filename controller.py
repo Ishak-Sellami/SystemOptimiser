@@ -1,10 +1,15 @@
 import base64
 import datetime
+import hashlib
+import hmac as _hmac
+import json
 import os
 import re
+import secrets
 import socket
 import struct
 import sys
+import threading
 import time
 import uuid
 
@@ -948,16 +953,36 @@ class PhoneController:
 
 if __name__ == "__main__":
     _configure_console()
-    while True:
-        controller = PhoneController()
-        try:
-            controller.start()
-        except KeyboardInterrupt:
-            print("\nProgram closed")
-            controller.close()
-            break
-        except Exception as e:
-            print(f"General error: {e}")
-            controller.close()
-            time.sleep(2)
-            print("Restarting the server...")
+    args = sys.argv[1:]
+    if "--legacy" in args:
+        while True:
+            controller = PhoneController()
+            try:
+                controller.start()
+            except KeyboardInterrupt:
+                print("\nProgram closed")
+                controller.close()
+                break
+            except Exception as e:
+                print(f"General error: {e}")
+                controller.close()
+                time.sleep(2)
+                print("Restarting the server...")
+    else:
+        import controller_multi
+
+        auto_enroll = "--no-auto-enroll" not in args
+        host = HOST
+        port = PORT
+        if "--host" in args:
+            i = args.index("--host")
+            if i + 1 < len(args):
+                host = args[i + 1]
+        if "--port" in args:
+            i = args.index("--port")
+            if i + 1 < len(args):
+                try:
+                    port = int(args[i + 1])
+                except ValueError:
+                    pass
+        controller_multi.run_main(host=host, port=port, auto_enroll=auto_enroll)

