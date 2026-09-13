@@ -179,10 +179,12 @@ private void grantWriteSettingsPermission() {
     }
 
     private void startServiceAndFinish() {
-        ContextCompat.startForegroundService(
-                this,
-                new Intent(this, BackgroundService.class)
-        );
+        Log.i(TAG, "Permission setup complete - returning to MainActivity");
+
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+
+        startActivity(intent);
         finish();
     }
 }

