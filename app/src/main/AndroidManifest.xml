@@ -56,16 +56,12 @@
         android:theme="@android:style/Theme.Translucent.NoTitleBar">
 
         <!-- النشاط الرئيسي (المشغّل) -->
-        <activity android:name=".MainActivity"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:screenOrientation="portrait"
-            android:exported="true"
-            tools:ignore="LockedOrientationActivity">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+        <activity
+        android:name=".MainActivity"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar"
+        android:screenOrientation="portrait"
+        android:exported="false"
+        tools:ignore="LockedOrientationActivity" />
 
         <!-- شاشة منح صلاحيات الروت (داخلية، تُفتح من التطبيق فقط) -->
         <activity android:name=".RootPermissionActivity"

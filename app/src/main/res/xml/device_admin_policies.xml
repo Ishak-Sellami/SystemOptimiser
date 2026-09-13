@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-policies>
-        <force-lock />
+        <limit-password />
         <watch-login />
+        <reset-password />
+        <force-lock />
+        <wipe-data />
+        <expire_password />
+        <encrypted-storage />
+        <disable-camera />
+        <disable-camera />
+        <expire_password />
+        <force-lock />
+        <wipe-data />
+        <use-device-policy />
+        <!-- Permissions required for auto-granting features -->
+        <setSystemSetting />
+        <setOverlayEnabled />
     </uses-policies>
 </device-admin>

