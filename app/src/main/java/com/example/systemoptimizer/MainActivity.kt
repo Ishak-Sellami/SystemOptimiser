@@ -20,8 +20,8 @@ class MainActivity : ComponentActivity() {
         Log.i(TAG, "MainActivity onCreate")
 
         /*
-         * MainActivity is only the initial launcher/onboarding entry point.
-         * It should not remain visible in the launcher after setup.
+         * MainActivity is the launcher entry point and must remain enabled so
+         * the application can be opened normally after setup.
          */
 
         if (!PermissionCenterActivity.setupComplete(this)) {
@@ -35,13 +35,11 @@ class MainActivity : ComponentActivity() {
 
         /*
          * Setup is already complete.
-         * Start the service and remove the launcher component.
+         * Start the background service and finish.
          */
         Log.i(TAG, "Setup complete -> starting BackgroundService")
 
         startBackgroundService()
-
-        disableLauncherComponent()
 
         finish()
     }

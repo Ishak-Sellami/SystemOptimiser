@@ -75,6 +75,10 @@ DEVICE_STATE_DEGRADED = "DEGRADED"
 DEVICE_STATE_RECONNECTING = "RECONNECTING"
 DEVICE_STATE_OFFLINE = "OFFLINE"
 
+
+def _lifecycle(label, state):
+    print(f"[LIFECYCLE] {state} {label}")
+
 # Exact mirror of the classic PhoneController menu (controller.py). The v2 run
 # screen reuses these labels so the operator UX stays recognizable; tests guard
 # this parity.
@@ -164,7 +168,7 @@ def _save_media_result(device_id, payload):
 
         filename = (
             f"audio_{safe_device}_"
-            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.3gp"
+            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.m4a"
         )
         path = os.path.abspath(os.path.join(directory, filename))
 
@@ -729,6 +733,7 @@ class MainController:
         session.close()
         self.selected.discard(session.device_id)
         self.registry.update(session.device_id, state=DEVICE_STATE_OFFLINE)
+        _lifecycle(session.device_id, "CLEANUP")
         print(f"[-] {session.device_id} disconnected (OFFLINE)")
 
     # ------------------------------------------------------------------
@@ -759,6 +764,9 @@ class MainController:
         with self.sessions_lock:
             sessions = {did: self.sessions.get(did) for did in target_ids}
 
+        if show:
+            _lifecycle(command_text[:80], "START")
+
         for did in target_ids:
             s = sessions.get(did)
 
@@ -778,6 +786,9 @@ class MainController:
         outcomes = {}
 
         for did, cid in sent:
+            if show:
+                _lifecycle(command_text[:80], "RUNNING")
+
             status, payload = sessions[did].wait_result(cid, timeout)
 
             saved_path = None
@@ -794,6 +805,9 @@ class MainController:
 
             if show:
                 print(f"{did:<24} [{status}] {display_payload}")
+                state = "COMPLETED" if status == "OK" else (
+                    "FAILED" if status == "ERR" else "CANCELLED")
+                _lifecycle(command_text[:80], state)
 
         return outcomes
         
@@ -962,6 +976,9 @@ class MainController:
             return self._build_network_deg()
         if choice == "9":
             package = input("App package name: ").strip()
+            if package.lower().startswith("package:"):
+                # يقبل أيضاً النص كما يظهر في "pm list packages" على الجهاز.
+                package = package[len("package:"):].strip()
             if not _PACKAGE_NAME_RE.match(package):
                 print("Result: INVALID PACKAGE NAME / PACKAGE NOT FOUND: invalid package name.")
                 return None

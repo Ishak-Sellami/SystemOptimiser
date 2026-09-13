@@ -74,6 +74,13 @@ public final class AgentConnectionManager implements NetworkMonitor.Listener, Be
     /** Minimal hooks into the owning service. */
     public interface ServiceHooks {
         void onExitRequested();
+
+        /**
+         * Whether the service still has an ongoing responsibility after the
+         * current session ends. When false, a normal session end stops the
+         * service instead of reconnecting forever.
+         */
+        boolean shouldKeepAlive();
     }
 
     public AgentConnectionManager(Context context,
@@ -114,6 +121,15 @@ public final class AgentConnectionManager implements NetworkMonitor.Listener, Be
                     break;
                 }
                 if (outcome == 0) {
+                    // Normal session end (controller closed the connection).
+                    // When the service has no ongoing responsibility, idle-stop
+                    // instead of reconnecting forever.
+                    if (!hooks.shouldKeepAlive()) {
+                        Log.i(TAG, "session ended with no active responsibility -> idle stop");
+                        running.set(false);
+                        hooks.onExitRequested();
+                        break;
+                    }
                     backoff = BACKOFF_MIN_MS;
                     sleepOrExit(NETWORK_CHANGE_DELAY_MS);
                 } else {
